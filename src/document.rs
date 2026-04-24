@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use crate::text_box::TextBox;
+use crate::image_box::ImageBox;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
@@ -22,8 +24,8 @@ pub struct Item {
     pub height: f64,
     pub rotation: f64,
     pub item_type: ItemType,
-    pub text: String,
-    pub image_path: Option<String>,
+    pub text_box: TextBox,
+    pub image_box: ImageBox,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -55,8 +57,8 @@ impl Default for Document {
                             height: 50.0,
                             rotation: 0.0,
                             item_type: ItemType::TextFrame,
-                            text: String::from("Sample text for the first frame."),
-                            image_path: None,
+                            text_box: TextBox::new("Sample text for the first frame.".to_string()),
+                            image_box: ImageBox::default(),
                         }
                     ],
                 }

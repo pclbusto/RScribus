@@ -1,3 +1,5 @@
+mod text_box;
+mod image_box;
 mod document;
 mod app;
 

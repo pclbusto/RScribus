@@ -4,9 +4,16 @@ use gtk::gdk;
 use std::collections::HashMap;
 use std::rc::Rc;
 use crate::document::{Document, Item, ItemType};
+use crate::text_box::{TextBox, KeyAction};
+use crate::image_box::{FitMode, ImageBox};
 
 const SCALE: f64 = 3.0;
-const TEXT_PAD: f64 = 4.0;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PageLayout {
+    Vertical,
+    Horizontal,
+}
 
 pub struct AppModel {
     document: Document,
@@ -20,12 +27,12 @@ pub struct AppModel {
     popover_pos: (f64, f64),
     popover_visible: bool,
     is_editing: bool,
-    cursor_pos: usize,
-    selection_anchor: Option<usize>,
-    just_started_editing: bool,
+    text_drag_active: bool,
+    request_focus: bool,
     zoom: f64,
     create_frame_type: ItemType,
     image_surfaces: HashMap<String, Rc<cairo::ImageSurface>>,
+    page_layout: PageLayout,
 }
 
 impl AppModel {
@@ -33,53 +40,70 @@ impl AppModel {
         SCALE * self.zoom
     }
 
-    fn get_editing_text(&self) -> String {
-        if let Some(id) = &self.selected_item_id {
-            if let Some(page) = self.document.pages.get(self.current_page) {
-                if let Some(item) = page.items.iter().find(|i| &i.id == id) {
-                    return item.text.clone();
-                }
+    fn find_item(&self, id: &str) -> Option<(usize, Item)> {
+        for (page_idx, page) in self.document.pages.iter().enumerate() {
+            if let Some(item) = page.items.iter().find(|i| i.id == id) {
+                return Some((page_idx, item.clone()));
             }
         }
-        String::new()
+        None
     }
 
-    fn set_editing_text(&mut self, text: String) {
-        let id = self.selected_item_id.clone();
-        if let Some(id) = id {
-            if let Some(page) = self.document.pages.get_mut(self.current_page) {
-                if let Some(item) = page.items.iter_mut().find(|i| i.id == id) {
-                    item.text = text;
-                }
+    fn find_item_mut(&mut self, id: &str) -> Option<(usize, &mut Item)> {
+        for (page_idx, page) in self.document.pages.iter_mut().enumerate() {
+            if let Some(item) = page.items.iter_mut().find(|i| i.id == id) {
+                return Some((page_idx, item));
             }
         }
+        None
     }
 
-    fn selection_range(&self) -> Option<(usize, usize)> {
-        let anchor = self.selection_anchor?;
-        if anchor == self.cursor_pos {
-            return None;
-        }
-        Some((anchor.min(self.cursor_pos), anchor.max(self.cursor_pos)))
-    }
-
-    fn delete_selection(&mut self) -> bool {
-        if let Some((start, end)) = self.selection_range() {
-            let mut text = self.get_editing_text();
-            text.drain(start..end);
-            self.cursor_pos = start;
-            self.selection_anchor = None;
-            self.set_editing_text(text);
-            true
-        } else {
-            false
-        }
-    }
-
-    fn selected_item_type(&self) -> Option<&ItemType> {
+    fn selected_item_type(&self) -> Option<ItemType> {
         let id = self.selected_item_id.as_ref()?;
-        let page = self.document.pages.get(self.current_page)?;
-        page.items.iter().find(|i| &i.id == id).map(|i| &i.item_type)
+        self.find_item(id).map(|(_, item)| item.item_type)
+    }
+
+    fn get_editing_text_box_mut(&mut self) -> Option<&mut TextBox> {
+        let id = self.selected_item_id.clone()?;
+        let (_, item) = self.find_item_mut(&id)?;
+        (item.item_type == ItemType::TextFrame).then_some(&mut item.text_box)
+    }
+
+    fn get_page_offset(&self, page_idx: usize) -> (f64, f64) {
+        let page_gap = 20.0;
+        match self.page_layout {
+            PageLayout::Vertical => {
+                let y = page_idx as f64 * (self.document.height + page_gap);
+                (0.0, y)
+            }
+            PageLayout::Horizontal => {
+                let x = page_idx as f64 * (self.document.width + page_gap);
+                (x, 0.0)
+            }
+        }
+    }
+
+    fn hit_test_all_pages(&self, x: f64, y: f64) -> Option<(usize, Item)> {
+        let x_mm = x / self.scale();
+        let y_mm = y / self.scale();
+
+        for (page_idx, page) in self.document.pages.iter().enumerate().rev() {
+            let (off_x, off_y) = self.get_page_offset(page_idx);
+            let local_x = x_mm - off_x;
+            let local_y = y_mm - off_y;
+
+            if local_x >= 0.0 && local_x <= self.document.width &&
+               local_y >= 0.0 && local_y <= self.document.height {
+                for item in page.items.iter().rev() {
+                    if local_x >= item.x && local_x <= item.x + item.width &&
+                       local_y >= item.y && local_y <= item.y + item.height
+                    {
+                        return Some((page_idx, item.clone()));
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -103,6 +127,10 @@ pub enum AppInput {
     ImageLoaded(String),
     FitFrameToImage,
     FitImageToFrame,
+    SetImageFitMode(crate::image_box::FitMode),
+    DeleteItem,
+    SetPageLayout(PageLayout),
+    ShowPreferences,
 }
 
 #[derive(Debug)]
@@ -135,6 +163,44 @@ impl Component for AppModel {
                         set_icon_name: "list-add-symbolic",
                         set_tooltip_text: Some("Add Page"),
                         connect_clicked => AppInput::AddPage,
+                    },
+                    pack_end = &gtk::MenuButton {
+                        set_icon_name: "open-menu-symbolic",
+                        set_tooltip_text: Some("Menu"),
+                        #[wrap(Some)]
+                        set_popover = &gtk::Popover {
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                set_spacing: 0,
+                                set_margin_all: 0,
+
+                                gtk::Button {
+                                    set_label: "Vertical Layout",
+                                    set_has_frame: false,
+                                    connect_clicked[sender] => move |btn| {
+                                        sender.input(AppInput::SetPageLayout(PageLayout::Vertical));
+                                        btn.ancestor(gtk::Popover::static_type()).and_then(|p| p.downcast::<gtk::Popover>().ok()).map(|p| p.popdown());
+                                    },
+                                },
+                                gtk::Button {
+                                    set_label: "Horizontal Layout",
+                                    set_has_frame: false,
+                                    connect_clicked[sender] => move |btn| {
+                                        sender.input(AppInput::SetPageLayout(PageLayout::Horizontal));
+                                        btn.ancestor(gtk::Popover::static_type()).and_then(|p| p.downcast::<gtk::Popover>().ok()).map(|p| p.popdown());
+                                    },
+                                },
+                                gtk::Separator {},
+                                gtk::Button {
+                                    set_label: "Preferences",
+                                    set_has_frame: false,
+                                    connect_clicked[sender] => move |btn| {
+                                        sender.input(AppInput::ShowPreferences);
+                                        btn.ancestor(gtk::Popover::static_type()).and_then(|p| p.downcast::<gtk::Popover>().ok()).map(|p| p.popdown());
+                                    },
+                                },
+                            }
+                        }
                     }
                 },
 
@@ -204,15 +270,15 @@ impl Component for AppModel {
                         gtk::Button {
                             set_label: "Edit Text",
                             #[watch]
-                            set_sensitive: model.selected_item_type() == Some(&ItemType::TextFrame) && !model.is_editing,
+                            set_sensitive: model.selected_item_type() == Some(ItemType::TextFrame) && !model.is_editing,
                             #[watch]
-                            set_visible: model.selected_item_type() == Some(&ItemType::TextFrame),
+                            set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
                             connect_clicked => AppInput::StartEdit,
                         },
                         gtk::Button {
                             set_label: "Import Image",
                             #[watch]
-                            set_visible: model.selected_item_type() == Some(&ItemType::ImageFrame),
+                            set_visible: model.selected_item_type() == Some(ItemType::ImageFrame),
                             connect_clicked => AppInput::ImportImage,
                         },
                     },
@@ -232,12 +298,26 @@ impl Component for AppModel {
                                 #[name = "canvas"]
                                 gtk::DrawingArea {
                                     #[watch]
-                                    set_content_width: (model.document.width * model.scale()) as i32,
+                                    set_content_width: {
+                                        let page_gap = 20.0;
+                                        let w = match model.page_layout {
+                                            PageLayout::Vertical => model.document.width,
+                                            PageLayout::Horizontal => {
+                                                model.document.pages.len() as f64 * model.document.width + (model.document.pages.len().saturating_sub(1) as f64) * page_gap
+                                            }
+                                        };
+                                        (w * model.scale()) as i32
+                                    },
                                     #[watch]
                                     set_content_height: {
                                         let page_gap = 20.0;
-                                        let total_h = model.document.pages.len() as f64 * model.document.height + (model.document.pages.len().saturating_sub(1) as f64) * page_gap;
-                                        (total_h * model.scale()) as i32
+                                        let h = match model.page_layout {
+                                            PageLayout::Vertical => {
+                                                model.document.pages.len() as f64 * model.document.height + (model.document.pages.len().saturating_sub(1) as f64) * page_gap
+                                            }
+                                            PageLayout::Horizontal => model.document.height,
+                                        };
+                                        (h * model.scale()) as i32
                                     },
                                     set_focusable: true,
                                     add_css_class: "card",
@@ -249,12 +329,11 @@ impl Component for AppModel {
                                         let d_current = model.drag_current;
                                         let selected = model.selected_item_id.clone();
                                         let editing = model.is_editing;
-                                        let cursor = model.cursor_pos;
-                                        let selection = model.selection_range();
                                         let zoom = model.zoom;
+                                        let layout = model.page_layout;
                                         let images = model.image_surfaces.clone();
                                         move |_area, cr, _w, _h| {
-                                            draw_canvas(cr, &doc, d_start, d_current, selected.clone(), editing, cursor, selection, &images, zoom);
+                                            draw_canvas(cr, &doc, d_start, d_current, selected.clone(), editing, &images, zoom, layout);
                                         }
                                     },
 
@@ -329,7 +408,7 @@ impl Component for AppModel {
                                         gtk::Separator {},
                                         gtk::Label {
                                             #[watch]
-                                            set_label: &get_info_text(&model.document, model.current_page, &model.selected_item_id),
+                                            set_label: &get_info_text(&model.document, &model.selected_item_id),
                                             set_xalign: 0.0,
                                         },
 
@@ -338,7 +417,7 @@ impl Component for AppModel {
                                             set_label: "Edit Text",
                                             add_css_class: "suggested-action",
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, model.current_page, &model.selected_item_id, &ItemType::TextFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::TextFrame),
                                             connect_clicked => AppInput::StartEdit,
                                         },
 
@@ -347,33 +426,56 @@ impl Component for AppModel {
                                             set_label: "Import Image",
                                             add_css_class: "suggested-action",
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, model.current_page, &model.selected_item_id, &ItemType::ImageFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::ImageFrame),
                                             connect_clicked => AppInput::ImportImage,
                                         },
 
                                         // Adjust Image section (only when ImageFrame has an image)
                                         gtk::Separator {
                                             #[watch]
-                                            set_visible: selected_image_frame_has_image(&model.document, model.current_page, &model.selected_item_id),
+                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_id),
                                         },
                                         gtk::Label {
                                             set_label: "Adjust Image",
                                             add_css_class: "heading",
                                             set_xalign: 0.0,
                                             #[watch]
-                                            set_visible: selected_image_frame_has_image(&model.document, model.current_page, &model.selected_item_id),
+                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_id),
+                                        },
+                                        gtk::Box {
+                                            set_orientation: gtk::Orientation::Horizontal,
+                                            set_spacing: 4,
+                                            add_css_class: "linked",
+                                            #[watch]
+                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_id),
+
+                                            gtk::ToggleButton {
+                                                set_label: "Stretch",
+                                                #[watch]
+                                                set_active: get_selected_fit_mode(&model.document, &model.selected_item_id) == Some(crate::image_box::FitMode::ImageToFrame),
+                                                connect_toggled[sender] => move |btn| {
+                                                    if btn.is_active() {
+                                                        sender.input(AppInput::SetImageFitMode(crate::image_box::FitMode::ImageToFrame));
+                                                    }
+                                                },
+                                            },
+                                            gtk::ToggleButton {
+                                                set_label: "Proportional",
+                                                #[watch]
+                                                set_active: get_selected_fit_mode(&model.document, &model.selected_item_id) == Some(crate::image_box::FitMode::FrameToImage),
+                                                connect_toggled[sender] => move |btn| {
+                                                    if btn.is_active() {
+                                                        sender.input(AppInput::SetImageFitMode(crate::image_box::FitMode::FrameToImage));
+                                                        sender.input(AppInput::FitFrameToImage);
+                                                    }
+                                                },
+                                            },
                                         },
                                         gtk::Button {
-                                            set_label: "Frame to Image",
+                                            set_label: "Reset to Original Size",
                                             #[watch]
-                                            set_visible: selected_image_frame_has_image(&model.document, model.current_page, &model.selected_item_id),
+                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_id),
                                             connect_clicked => AppInput::FitFrameToImage,
-                                        },
-                                        gtk::Button {
-                                            set_label: "Image to Frame",
-                                            #[watch]
-                                            set_visible: selected_image_frame_has_image(&model.document, model.current_page, &model.selected_item_id),
-                                            connect_clicked => AppInput::FitImageToFrame,
                                         },
                                     }
                                 }
@@ -402,12 +504,12 @@ impl Component for AppModel {
             popover_pos: (0.0, 0.0),
             popover_visible: false,
             is_editing: false,
-            cursor_pos: 0,
-            selection_anchor: None,
-            just_started_editing: false,
+            text_drag_active: false,
+            request_focus: false,
             zoom: 1.0,
             create_frame_type: ItemType::TextFrame,
             image_surfaces: HashMap::new(),
+            page_layout: PageLayout::Vertical,
         };
 
         let widgets = view_output!();
@@ -424,14 +526,26 @@ impl Component for AppModel {
         self.update(message, sender.clone(), root);
         self.update_view(widgets, sender);
 
-        if self.just_started_editing {
-            self.just_started_editing = false;
+        if self.request_focus {
+            self.request_focus = false;
             widgets.canvas.grab_focus();
         }
     }
 
     fn update(&mut self, message: Self::Input, sender: ComponentSender<Self>, root: &Self::Root) {
         match message {
+            AppInput::SetPageLayout(layout) => {
+                self.page_layout = layout;
+            }
+            AppInput::ShowPreferences => {
+                let dialog = adw::MessageDialog::builder()
+                    .heading("Preferences")
+                    .body("RScribus Preferences\n\n(This is a placeholder for actual preferences settings)")
+                    .transient_for(root)
+                    .build();
+                dialog.add_response("close", "Close");
+                dialog.present();
+            }
             AppInput::AddPage => {
                 self.document.pages.push(crate::document::Page::default());
             }
@@ -445,18 +559,21 @@ impl Component for AppModel {
                 self.create_frame_type = ft;
             }
             AppInput::StartEdit => {
-                if self.selected_item_type() == Some(&ItemType::TextFrame) {
-                    let text_len = self.get_editing_text().len();
-                    self.cursor_pos = text_len;
-                    self.selection_anchor = None;
+                if self.selected_item_type() == Some(ItemType::TextFrame) {
+                    if let Some(tb) = self.get_editing_text_box_mut() {
+                        tb.cursor_pos = tb.text.len();
+                        tb.selection_anchor = None;
+                    }
                     self.is_editing = true;
-                    self.just_started_editing = true;
+                    self.request_focus = true;
                     self.popover_visible = false;
                 }
             }
             AppInput::ExitEdit => {
                 self.is_editing = false;
-                self.selection_anchor = None;
+                if let Some(tb) = self.get_editing_text_box_mut() {
+                    tb.selection_anchor = None;
+                }
             }
             AppInput::ImportImage => {
                 if self.selected_item_id.is_some() {
@@ -483,36 +600,34 @@ impl Component for AppModel {
                 }
             }
             AppInput::ImageLoaded(path) => {
-                if let Some(surface) = load_image_surface(&path) {
+                if let Some(surface) = ImageBox::load_surface(&path) {
                     self.image_surfaces.insert(path.clone(), Rc::new(surface));
                 }
                 if let Some(id) = self.selected_item_id.clone() {
-                    if let Some(page) = self.document.pages.get_mut(self.current_page) {
-                        if let Some(item) = page.items.iter_mut().find(|i| i.id == id) {
-                            item.image_path = Some(path);
-                        }
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        item.image_box.image_path = Some(path);
                     }
                 }
                 self.popover_visible = false;
             }
             AppInput::FitFrameToImage => {
                 let id = self.selected_item_id.clone();
-                let path = id.as_ref().and_then(|id| {
-                    self.document.pages.get(self.current_page)
-                        .and_then(|p| p.items.iter().find(|i| &i.id == id))
-                        .and_then(|i| i.image_path.clone())
-                });
-                if let (Some(id), Some(path)) = (id, path) {
-                    if let Some(surface) = self.image_surfaces.get(&path) {
-                        let img_w = surface.width() as f64;
-                        let img_h = surface.height() as f64;
-                        // Convert pixels → mm at 96 DPI
-                        let w_mm = img_w * 25.4 / 96.0;
-                        let h_mm = img_h * 25.4 / 96.0;
-                        if let Some(page) = self.document.pages.get_mut(self.current_page) {
-                            if let Some(item) = page.items.iter_mut().find(|i| i.id == id) {
-                                item.width = w_mm;
-                                item.height = h_mm;
+                let item_data = id.as_ref().and_then(|id| self.find_item(id));
+                
+                if let Some((_page_idx, item)) = item_data {
+                    if let Some(path) = &item.image_box.image_path {
+                        if let Some(surface) = self.image_surfaces.get(path) {
+                            let img_w = surface.width() as f64;
+                            let img_h = surface.height() as f64;
+                            // Convert pixels → mm at 96 DPI
+                            let w_mm = img_w * 25.4 / 96.0;
+                            let h_mm = img_h * 25.4 / 96.0;
+                            
+                            // Re-fetch mutably to update
+                            if let Some((_, item_mut)) = self.find_item_mut(&item.id) {
+                                item_mut.width = w_mm;
+                                item_mut.height = h_mm;
+                                item_mut.image_box.fit_mode = FitMode::FrameToImage;
                             }
                         }
                     }
@@ -520,257 +635,209 @@ impl Component for AppModel {
                 self.popover_visible = false;
             }
             AppInput::FitImageToFrame => {
-                // Image already scales to fill the frame by default; just close popover.
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        item.image_box.fit_mode = FitMode::ImageToFrame;
+                    }
+                }
                 self.popover_visible = false;
+            }
+            AppInput::SetImageFitMode(mode) => {
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        item.image_box.fit_mode = mode;
+                    }
+                }
+            }
+            AppInput::DeleteItem => {
+                if let Some(id) = self.selected_item_id.clone() {
+                    let mut found = None;
+                    for (idx, page) in self.document.pages.iter().enumerate() {
+                        if page.items.iter().any(|i| i.id == id) {
+                            found = Some(idx);
+                            break;
+                        }
+                    }
+                    if let Some(page_idx) = found {
+                        if let Some(page) = self.document.pages.get_mut(page_idx) {
+                            page.items.retain(|item| item.id != id);
+                            self.selected_item_id = None;
+                        }
+                    }
+                }
             }
             AppInput::PasteText(text) => {
                 if !self.is_editing { return; }
-                self.delete_selection();
-                let mut current = self.get_editing_text();
-                current.insert_str(self.cursor_pos, &text);
-                self.cursor_pos += text.len();
-                self.set_editing_text(current);
+                if let Some(tb) = self.get_editing_text_box_mut() {
+                    tb.insert_text(&text);
+                }
             }
             AppInput::TextKeyPressed(key, state) => {
-                if !self.is_editing { return; }
-
-                let ctrl  = state.contains(gdk::ModifierType::CONTROL_MASK);
-                let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
-
-                if ctrl {
-                    match key {
-                        gdk::Key::a | gdk::Key::A => {
-                            let len = self.get_editing_text().len();
-                            self.selection_anchor = Some(0);
-                            self.cursor_pos = len;
-                        }
-                        gdk::Key::c | gdk::Key::C => {
-                            if let Some((start, end)) = self.selection_range() {
-                                let text = self.get_editing_text();
-                                let selected = text[start..end].to_string();
-                                gtk::gdk::Display::default()
-                                    .expect("no display")
-                                    .clipboard()
-                                    .set_text(&selected);
-                            }
-                        }
-                        gdk::Key::x | gdk::Key::X => {
-                            if let Some((start, end)) = self.selection_range() {
-                                let text = self.get_editing_text();
-                                let selected = text[start..end].to_string();
-                                gtk::gdk::Display::default()
-                                    .expect("no display")
-                                    .clipboard()
-                                    .set_text(&selected);
-                                self.delete_selection();
-                            }
-                        }
-                        gdk::Key::v | gdk::Key::V => {
-                            let s = sender.clone();
-                            let clipboard = gtk::gdk::Display::default()
-                                .expect("no display")
-                                .clipboard();
-                            gtk::glib::MainContext::default().spawn_local(async move {
-                                if let Ok(Some(text)) = clipboard.read_text_future().await {
-                                    s.input(AppInput::PasteText(text.to_string()));
-                                }
-                            });
-                        }
-                        _ => {}
+                if !self.is_editing {
+                    if key == gdk::Key::Delete && self.selected_item_id.is_some() {
+                        sender.input(AppInput::DeleteItem);
                     }
                     return;
                 }
-
-                let text = self.get_editing_text();
-                match key {
-                    gdk::Key::Escape => {
+                let action = if let Some(tb) = self.get_editing_text_box_mut() {
+                    tb.handle_key(key, state)
+                } else {
+                    return;
+                };
+                match action {
+                    KeyAction::ExitEdit => {
                         self.is_editing = false;
-                        self.selection_anchor = None;
                     }
-                    gdk::Key::Left => {
-                        if shift {
-                            if self.selection_anchor.is_none() {
-                                self.selection_anchor = Some(self.cursor_pos);
+                    KeyAction::RequestPaste => {
+                        let s = sender.clone();
+                        let clipboard = gdk::Display::default()
+                            .expect("no display")
+                            .clipboard();
+                        gtk::glib::MainContext::default().spawn_local(async move {
+                            if let Ok(Some(text)) = clipboard.read_text_future().await {
+                                s.input(AppInput::PasteText(text.to_string()));
                             }
-                            if self.cursor_pos > 0 {
-                                self.cursor_pos = prev_char_boundary(&text, self.cursor_pos);
-                            }
-                        } else {
-                            if self.selection_range().is_some() {
-                                let (start, _) = self.selection_range().unwrap();
-                                self.cursor_pos = start;
-                            } else if self.cursor_pos > 0 {
-                                self.cursor_pos = prev_char_boundary(&text, self.cursor_pos);
-                            }
-                            self.selection_anchor = None;
-                        }
+                        });
                     }
-                    gdk::Key::Right => {
-                        if shift {
-                            if self.selection_anchor.is_none() {
-                                self.selection_anchor = Some(self.cursor_pos);
-                            }
-                            if self.cursor_pos < text.len() {
-                                self.cursor_pos = next_char_boundary(&text, self.cursor_pos);
-                            }
-                        } else {
-                            if self.selection_range().is_some() {
-                                let (_, end) = self.selection_range().unwrap();
-                                self.cursor_pos = end;
-                            } else if self.cursor_pos < text.len() {
-                                self.cursor_pos = next_char_boundary(&text, self.cursor_pos);
-                            }
-                            self.selection_anchor = None;
-                        }
-                    }
-                    gdk::Key::Home => {
-                        if shift && self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_pos);
-                        } else if !shift {
-                            self.selection_anchor = None;
-                        }
-                        let before = &text[..self.cursor_pos];
-                        self.cursor_pos = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                    }
-                    gdk::Key::End => {
-                        if shift && self.selection_anchor.is_none() {
-                            self.selection_anchor = Some(self.cursor_pos);
-                        } else if !shift {
-                            self.selection_anchor = None;
-                        }
-                        let after = &text[self.cursor_pos..];
-                        self.cursor_pos = after.find('\n')
-                            .map(|i| self.cursor_pos + i)
-                            .unwrap_or(text.len());
-                    }
-                    gdk::Key::BackSpace => {
-                        if !self.delete_selection() && self.cursor_pos > 0 {
-                            let prev = prev_char_boundary(&text, self.cursor_pos);
-                            let mut new_text = text;
-                            new_text.drain(prev..self.cursor_pos);
-                            self.cursor_pos = prev;
-                            self.set_editing_text(new_text);
-                        }
-                    }
-                    gdk::Key::Delete => {
-                        if !self.delete_selection() && self.cursor_pos < text.len() {
-                            let next = next_char_boundary(&text, self.cursor_pos);
-                            let mut new_text = text;
-                            new_text.drain(self.cursor_pos..next);
-                            self.set_editing_text(new_text);
-                        }
-                    }
-                    gdk::Key::Return | gdk::Key::KP_Enter => {
-                        self.delete_selection();
-                        let mut new_text = self.get_editing_text();
-                        new_text.insert(self.cursor_pos, '\n');
-                        self.cursor_pos += 1;
-                        self.set_editing_text(new_text);
-                    }
-                    _ => {
-                        if let Some(ch) = key.to_unicode() {
-                            if !ch.is_control() {
-                                self.delete_selection();
-                                let byte_len = ch.len_utf8();
-                                let mut new_text = self.get_editing_text();
-                                new_text.insert(self.cursor_pos, ch);
-                                self.cursor_pos += byte_len;
-                                self.set_editing_text(new_text);
-                            }
-                        }
-                    }
+                    KeyAction::Handled => {}
                 }
             }
             AppInput::Zoom(delta) => {
                 self.zoom = (self.zoom + delta * 0.1).clamp(0.1, 5.0);
             }
             AppInput::DragStart(x, y) => {
-                let page_gap = 20.0;
-                let total_page_h_mm = self.document.height + page_gap;
-                let raw_y_mm = y / self.scale();
-                let page_idx = (raw_y_mm / total_page_h_mm).floor() as usize;
-                let page_idx = page_idx.min(self.document.pages.len().saturating_sub(1));
-                self.current_page = page_idx;
                 let x_mm = x / self.scale();
-                let y_mm = raw_y_mm - (page_idx as f64 * total_page_h_mm);
+                let y_mm = y / self.scale();
 
                 if self.is_editing {
-                    let hit = self.selected_item_id.as_ref()
-                        .and_then(|id| self.document.pages.get(self.current_page)
-                            .and_then(|page| page.items.iter().find(|i| &i.id == id)))
-                        .filter(|item| item.item_type == ItemType::TextFrame)
-                        .filter(|item| {
-                            x_mm >= item.x && x_mm <= item.x + item.width &&
-                            y_mm >= item.y && y_mm <= item.y + item.height
-                        })
-                        .map(|item| hit_test_layout(item, x_mm, y_mm));
-
-                    match hit {
-                        Some(pos) => {
-                            self.cursor_pos = pos;
-                            self.selection_anchor = None;
-                        }
-                        None => {
-                            self.is_editing = false;
-                            self.selection_anchor = None;
+                    if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
+                        if item.item_type == ItemType::TextFrame && Some(item.id.clone()) == self.selected_item_id {
+                            let (off_x, off_y) = self.get_page_offset(page_idx);
+                            let local_x = x_mm - off_x;
+                            let local_y = y_mm - off_y;
+                            let pos = item.text_box.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE);
+                            
+                            if let Some(tb) = self.get_editing_text_box_mut() {
+                                tb.cursor_pos = pos;
+                                tb.selection_anchor = Some(pos);
+                            }
+                            self.drag_start = Some((x, y));
+                            self.text_drag_active = true;
+                            self.current_page = page_idx;
+                            return;
                         }
                     }
-                    return;
+                    self.is_editing = false;
+                    if let Some(tb) = self.get_editing_text_box_mut() {
+                        tb.selection_anchor = None;
+                    }
                 }
 
                 self.drag_start = Some((x, y));
                 self.drag_current = Some((x, y));
 
-                if let Some(selected_id) = &self.selected_item_id {
-                    if let Some(page) = self.document.pages.get(self.current_page) {
-                        if let Some(item) = page.items.iter().find(|i| &i.id == selected_id) {
-                            let handles = get_handle_positions(item);
-                            for (idx, (hx, hy)) in handles.iter().enumerate() {
-                                if (x_mm - hx).abs() < 2.0 && (y_mm - hy).abs() < 2.0 {
-                                    self.active_handle = Some(idx);
-                                    self.initial_item_rect = Some((item.x, item.y, item.width, item.height));
-                                    return;
-                                }
+                let handle_hit = if let Some(selected_id) = &self.selected_item_id {
+                    if let Some((page_idx, item)) = self.find_item(selected_id) {
+                        let (off_x, off_y) = self.get_page_offset(page_idx);
+                        let local_x = x_mm - off_x;
+                        let local_y = y_mm - off_y;
+                        
+                        let handles = get_handle_positions(&item);
+                        let mut hit = None;
+                        for (idx, (hx, hy)) in handles.iter().enumerate() {
+                            if (local_x - hx).abs() < 2.0 && (local_y - hy).abs() < 2.0 {
+                                hit = Some((idx, item.x, item.y, item.width, item.height, page_idx));
+                                break;
                             }
                         }
-                    }
-                }
+                        hit
+                    } else { None }
+                } else { None };
 
-                let mut found_hit = None;
-                if let Some(page) = self.document.pages.get(self.current_page) {
-                    for item in page.items.iter().rev() {
-                        if x_mm >= item.x && x_mm <= item.x + item.width &&
-                           y_mm >= item.y && y_mm <= item.y + item.height
-                        {
-                            found_hit = Some((item.id.clone(), item.x, item.y, item.width, item.height));
-                            break;
-                        }
-                    }
-                }
-
-                if let Some((id, ix, iy, iw, ih)) = found_hit {
-                    self.selected_item_id = Some(id);
+                if let Some((idx, ix, iy, iw, ih, p_idx)) = handle_hit {
+                    self.active_handle = Some(idx);
                     self.initial_item_rect = Some((ix, iy, iw, ih));
+                    self.current_page = p_idx;
+                    self.request_focus = true;
+                    return;
+                }
+
+                if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
+                    self.selected_item_id = Some(item.id);
+                    self.initial_item_rect = Some((item.x, item.y, item.width, item.height));
                     self.is_moving = true;
+                    self.current_page = page_idx;
+                    self.request_focus = true;
                 } else {
                     self.selected_item_id = None;
                     self.initial_item_rect = None;
                     self.is_moving = false;
                     self.active_handle = None;
+                    self.request_focus = true;
+                    
+                    // Determine current page based on layout
+                    let page_gap = 20.0;
+                    match self.page_layout {
+                        PageLayout::Vertical => {
+                            self.current_page = (y_mm / (self.document.height + page_gap)).floor() as usize;
+                        }
+                        PageLayout::Horizontal => {
+                            self.current_page = (x_mm / (self.document.width + page_gap)).floor() as usize;
+                        }
+                    }
+                    self.current_page = self.current_page.min(self.document.pages.len().saturating_sub(1));
                 }
             }
             AppInput::DragUpdate(offset_x, offset_y) => {
+                if self.text_drag_active {
+                    if let Some((sx, sy)) = self.drag_start {
+                        let x_mm = (sx + offset_x) / self.scale();
+                        let y_mm = (sy + offset_y) / self.scale();
+
+                        let hit_data = if let Some(id) = &self.selected_item_id {
+                            self.find_item(id).map(|(page_idx, item)| {
+                                let (off_x, off_y) = self.get_page_offset(page_idx);
+                                let local_x = x_mm - off_x;
+                                let local_y = y_mm - off_y;
+                                item.text_box.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                            })
+                        } else { None };
+
+                        if let Some(pos) = hit_data {
+                            if let Some(tb) = self.get_editing_text_box_mut() {
+                                tb.cursor_pos = pos;
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 if let Some((sx, sy)) = self.drag_start {
                     self.drag_current = Some((sx + offset_x, sy + offset_y));
                     let dx = offset_x / self.scale();
                     let dy = offset_y / self.scale();
-                    if let (Some(id), Some(page), Some((ix, iy, iw, ih))) = (
-                        &self.selected_item_id,
-                        self.document.pages.get_mut(self.current_page),
-                        self.initial_item_rect,
-                    ) {
-                        if let Some(item) = page.items.iter_mut().find(|i| &i.id == id) {
-                            if let Some(handle_idx) = self.active_handle {
+                    
+                    let active_handle = self.active_handle;
+                    let is_moving = self.is_moving;
+
+                    if let (Some(id), Some((ix, iy, iw, ih))) = (self.selected_item_id.clone(), self.initial_item_rect) {
+                        let mut item_moved_to_new_page = None;
+                        let layout = self.page_layout;
+                        let doc_w = self.document.width;
+                        let doc_h = self.document.height;
+
+                        // Pre-calculate image ratio if needed to avoid borrow checker issues
+                        let image_ratio = if let Some((_, item)) = self.find_item(&id) {
+                            if item.item_type == ItemType::ImageFrame && item.image_box.fit_mode == FitMode::FrameToImage {
+                                item.image_box.image_path.as_ref().and_then(|path| {
+                                    self.image_surfaces.get(path).map(|surf| surf.width() as f64 / surf.height() as f64)
+                                })
+                            } else { None }
+                        } else { None };
+                        
+                        // First find the item and update its position locally
+                        if let Some((page_idx, item)) = self.find_item_mut(&id) {
+                            if let Some(handle_idx) = active_handle {
                                 match handle_idx {
                                     0 => { item.x = ix + dx; item.y = iy + dy; item.width = iw - dx; item.height = ih - dy; }
                                     1 => { item.y = iy + dy; item.height = ih - dy; }
@@ -782,38 +849,89 @@ impl Component for AppModel {
                                     7 => { item.x = ix + dx; item.width = iw - dx; }
                                     _ => {}
                                 }
+
+                                // Apply proportional constraint if in FrameToImage mode
+                                if let Some(ratio) = image_ratio {
+                                    match handle_idx {
+                                        3 | 7 | 4 | 6 => { // Width-driven or corners
+                                            item.height = item.width / ratio;
+                                            if handle_idx == 6 || handle_idx == 0 { // Bottom-Left or Top-Left
+                                                // y might need adjustment if we want to keep it centered or similar, 
+                                                // but for now simple width-based height adjustment.
+                                            }
+                                        }
+                                        1 | 5 => { // Height-driven
+                                            item.width = item.height * ratio;
+                                        }
+                                        0 | 2 => { // Top corners
+                                            item.width = item.height * ratio;
+                                            // Re-adjust X to maintain anchor if necessary
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
                                 if item.width < 1.0 { item.width = 1.0; }
                                 if item.height < 1.0 { item.height = 1.0; }
-                            } else if self.is_moving {
+                            } else if is_moving {
                                 item.x = ix + dx;
                                 item.y = iy + dy;
+                                
+                                // Check if item should move to another page
+                                let page_gap = 20.0;
+                                let (off_x, off_y) = match layout {
+                                    PageLayout::Vertical => (0.0, page_idx as f64 * (doc_h + page_gap)),
+                                    PageLayout::Horizontal => (page_idx as f64 * (doc_w + page_gap), 0.0),
+                                };
+                                let abs_x_mm = off_x + item.x + item.width / 2.0;
+                                let abs_y_mm = off_y + item.y + item.height / 2.0;
+
+                                let target_page_idx = match layout {
+                                    PageLayout::Vertical => (abs_y_mm / (doc_h + page_gap)).floor() as usize,
+                                    PageLayout::Horizontal => (abs_x_mm / (doc_w + page_gap)).floor() as usize,
+                                };
+                                let target_page_idx = target_page_idx.min(self.document.pages.len().saturating_sub(1));
+                                
+                                if target_page_idx != page_idx {
+                                    item_moved_to_new_page = Some((page_idx, target_page_idx));
+                                }
+                            }
+                        }
+
+                        // If page change is needed, handle it here
+                        if let Some((old_idx, new_idx)) = item_moved_to_new_page {
+                            if let Some(old_page) = self.document.pages.get_mut(old_idx) {
+                                if let Some(pos) = old_page.items.iter().position(|i| i.id == id) {
+                                    let mut item = old_page.items.remove(pos);
+                                    
+                                    let (old_off_x, old_off_y) = self.get_page_offset(old_idx);
+                                    let (new_off_x, new_off_y) = self.get_page_offset(new_idx);
+
+                                    let abs_x = old_off_x + item.x;
+                                    let abs_y = old_off_y + item.y;
+                                    item.x = abs_x - new_off_x;
+                                    item.y = abs_y - new_off_y;
+                                    
+                                    if let Some(new_page) = self.document.pages.get_mut(new_idx) {
+                                        new_page.items.push(item);
+                                        self.current_page = new_idx;
+                                        if let Some((ix_ref, iy_ref, _, _)) = &mut self.initial_item_rect {
+                                            let abs_ix = old_off_x + *ix_ref;
+                                            let abs_iy = old_off_y + *iy_ref;
+                                            *ix_ref = abs_ix - new_off_x;
+                                            *iy_ref = abs_iy - new_off_y;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
             AppInput::RightClick(x, y) => {
-                let page_gap = 20.0;
-                let total_page_h_mm = self.document.height + page_gap;
-                let raw_y_mm = y / self.scale();
-                let page_idx = (raw_y_mm / total_page_h_mm).floor() as usize;
-                let page_idx = page_idx.min(self.document.pages.len().saturating_sub(1));
-                self.current_page = page_idx;
-                let x_mm = x / self.scale();
-                let y_mm = raw_y_mm - (page_idx as f64 * total_page_h_mm);
-                let mut found_hit = None;
-                if let Some(page) = self.document.pages.get(self.current_page) {
-                    for item in page.items.iter().rev() {
-                        if x_mm >= item.x && x_mm <= item.x + item.width &&
-                           y_mm >= item.y && y_mm <= item.y + item.height
-                        {
-                            found_hit = Some(item.id.clone());
-                            break;
-                        }
-                    }
-                }
-                if let Some(id) = found_hit {
-                    self.selected_item_id = Some(id);
+                if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
+                    self.selected_item_id = Some(item.id.clone());
+                    self.current_page = page_idx;
                     self.popover_pos = (x, y);
                     self.popover_visible = true;
                 } else {
@@ -821,47 +939,60 @@ impl Component for AppModel {
                 }
             }
             AppInput::DoubleClick(x, y) => {
-                let page_gap = 20.0;
-                let total_page_h_mm = self.document.height + page_gap;
-                let raw_y_mm = y / self.scale();
-                let page_idx = (raw_y_mm / total_page_h_mm).floor() as usize;
-                let page_idx = page_idx.min(self.document.pages.len().saturating_sub(1));
-                self.current_page = page_idx;
                 let x_mm = x / self.scale();
-                let y_mm = raw_y_mm - (page_idx as f64 * total_page_h_mm);
-                if let Some(page) = self.document.pages.get(self.current_page) {
-                    if let Some(item) = page.items.iter().find(|item| {
-                        x_mm >= item.x && x_mm <= item.x + item.width &&
-                        y_mm >= item.y && y_mm <= item.y + item.height
-                    }) {
-                        match item.item_type {
-                            ItemType::TextFrame => {
-                                let text_len = item.text.len();
-                                self.selected_item_id = Some(item.id.clone());
-                                self.cursor_pos = text_len;
-                                self.selection_anchor = None;
-                                self.is_editing = true;
-                                self.just_started_editing = true;
+                let y_mm = y / self.scale();
+
+                if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
+                    let (off_x, off_y) = self.get_page_offset(page_idx);
+                    let local_x = x_mm - off_x;
+                    let local_y = y_mm - off_y;
+                    let click_pos = item.text_box.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE);
+                    let id = item.id.clone();
+                    let item_type = item.item_type.clone();
+
+                    match item_type {
+                        ItemType::TextFrame => {
+                            let already_editing = self.is_editing
+                                && self.selected_item_id.as_deref() == Some(&id);
+                            self.selected_item_id = Some(id);
+                            self.current_page = page_idx;
+                            self.is_editing = true;
+                            self.request_focus = true;
+
+                            if already_editing {
+                                if let Some(tb) = self.get_editing_text_box_mut() {
+                                    tb.select_word_at(click_pos);
+                                }
+                            } else {
+                                if let Some(tb) = self.get_editing_text_box_mut() {
+                                    tb.cursor_pos = click_pos;
+                                    tb.selection_anchor = None;
+                                }
                             }
-                            ItemType::ImageFrame => {
-                                self.selected_item_id = Some(item.id.clone());
-                                // Double-click on image frame opens import dialog
-                                sender.input(AppInput::ImportImage);
-                            }
-                            _ => {}
                         }
+                        ItemType::ImageFrame => {
+                            self.selected_item_id = Some(id);
+                            self.current_page = page_idx;
+                            sender.input(AppInput::ImportImage);
+                        }
+                        _ => {}
                     }
                 }
             }
             AppInput::DragEnd => {
+                if self.text_drag_active {
+                    self.text_drag_active = false;
+                    self.drag_start = None;
+                    self.drag_current = None;
+                    return;
+                }
+
                 if !self.is_moving && self.active_handle.is_none() {
                     if let (Some((sx, sy)), Some((cx, cy))) = (self.drag_start, self.drag_current) {
-                        let page_gap = 20.0;
-                        let total_page_h_mm = self.document.height + page_gap;
-                        let page_y_offset_mm = self.current_page as f64 * total_page_h_mm;
+                        let (off_x, off_y) = self.get_page_offset(self.current_page);
 
-                        let x = sx.min(cx) / self.scale();
-                        let y = (sy.min(cy) / self.scale()) - page_y_offset_mm;
+                        let x = (sx.min(cx) / self.scale()) - off_x;
+                        let y = (sy.min(cy) / self.scale()) - off_y;
                         let width = (sx - cx).abs() / self.scale();
                         let height = (sy - cy).abs() / self.scale();
                         if width > 1.0 && height > 1.0 {
@@ -872,8 +1003,8 @@ impl Component for AppModel {
                                     x, y, width, height,
                                     rotation: 0.0,
                                     item_type: self.create_frame_type.clone(),
-                                    text: String::new(),
-                                    image_path: None,
+                                    text_box: TextBox::default(),
+                                    image_box: ImageBox::default(),
                                 });
                                 self.selected_item_id = Some(new_id);
                             }
@@ -885,47 +1016,56 @@ impl Component for AppModel {
                 self.initial_item_rect = None;
                 self.active_handle = None;
                 self.is_moving = false;
+                self.request_focus = true;
             }
         }
     }
 }
 
-fn prev_char_boundary(s: &str, pos: usize) -> usize {
-    if pos == 0 { return 0; }
-    let mut i = pos - 1;
-    while i > 0 && !s.is_char_boundary(i) { i -= 1; }
-    i
-}
-
-fn next_char_boundary(s: &str, pos: usize) -> usize {
-    let mut i = pos + 1;
-    while i < s.len() && !s.is_char_boundary(i) { i += 1; }
-    i.min(s.len())
-}
-
-fn is_selected_type(doc: &Document, page_idx: usize, selected_id: &Option<String>, ty: &ItemType) -> bool {
+fn is_selected_type(doc: &Document, selected_id: &Option<String>, ty: &ItemType) -> bool {
     selected_id.as_ref()
-        .and_then(|id| doc.pages.get(page_idx)
-            .and_then(|p| p.items.iter().find(|i| &i.id == id)))
-        .map(|i| &i.item_type == ty)
+        .and_then(|id| {
+            for page in &doc.pages {
+                if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+                    return Some(&item.item_type == ty);
+                }
+            }
+            None
+        })
         .unwrap_or(false)
 }
 
-fn selected_image_frame_has_image(doc: &Document, page_idx: usize, selected_id: &Option<String>) -> bool {
+fn selected_image_frame_has_image(doc: &Document, selected_id: &Option<String>) -> bool {
     selected_id.as_ref()
-        .and_then(|id| doc.pages.get(page_idx)
-            .and_then(|p| p.items.iter().find(|i| &i.id == id)))
-        .map(|i| i.item_type == ItemType::ImageFrame && i.image_path.is_some())
+        .and_then(|id| {
+            for page in &doc.pages {
+                if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+                    return Some(item.item_type == ItemType::ImageFrame && item.image_box.image_path.is_some());
+                }
+            }
+            None
+        })
         .unwrap_or(false)
 }
 
-fn get_info_text(doc: &Document, page_idx: usize, selected_id: &Option<String>) -> String {
+fn get_selected_fit_mode(doc: &Document, selected_id: &Option<String>) -> Option<crate::image_box::FitMode> {
+    selected_id.as_ref().and_then(|id| {
+        for page in &doc.pages {
+            if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+                return Some(item.image_box.fit_mode);
+            }
+        }
+        None
+    })
+}
+
+fn get_info_text(doc: &Document, selected_id: &Option<String>) -> String {
     if let Some(id) = selected_id {
-        if let Some(page) = doc.pages.get(page_idx) {
+        for page in &doc.pages {
             if let Some(item) = page.items.iter().find(|i| &i.id == id) {
                 return match &item.item_type {
                     ItemType::TextFrame => {
-                        let text = &item.text;
+                        let text = &item.text_box.text;
                         let paragraphs = text.split('\n').filter(|s| !s.is_empty()).count();
                         let words = text.split_whitespace().count();
                         let characters = text.len();
@@ -936,7 +1076,7 @@ fn get_info_text(doc: &Document, page_idx: usize, selected_id: &Option<String>) 
                         )
                     }
                     ItemType::ImageFrame => {
-                        let image_info = item.image_path.as_ref()
+                        let image_info = item.image_box.image_path.as_ref()
                             .and_then(|p| std::path::Path::new(p).file_name())
                             .map(|n| format!("\nFile: {}", n.to_string_lossy()))
                             .unwrap_or_else(|| "\nNo image loaded".to_string());
@@ -964,16 +1104,6 @@ fn get_handle_positions(item: &Item) -> [(f64, f64); 8] {
     ]
 }
 
-fn load_image_surface(path: &str) -> Option<cairo::ImageSurface> {
-    let texture = gdk::Texture::from_filename(path).ok()?;
-    let w = texture.width();
-    let h = texture.height();
-    let stride = w as usize * 4;
-    let mut data = vec![0u8; stride * h as usize];
-    texture.download(&mut data, stride);
-    // GDK_MEMORY_DEFAULT is B8G8R8A8_PREMULTIPLIED, which matches Cairo ARGB32 on little-endian.
-    cairo::ImageSurface::create_for_data(data, cairo::Format::ARgb32, w, h, stride as i32).ok()
-}
 
 fn draw_canvas(
     cr: &gtk::cairo::Context,
@@ -982,20 +1112,22 @@ fn draw_canvas(
     drag_current: Option<(f64, f64)>,
     selected_id: Option<String>,
     is_editing: bool,
-    cursor_pos: usize,
-    selection: Option<(usize, usize)>,
     images: &HashMap<String, Rc<cairo::ImageSurface>>,
     zoom: f64,
+    layout: PageLayout,
 ) {
     cr.save().unwrap();
     cr.scale(zoom, zoom);
 
     let page_gap = 20.0;
     for (page_idx, page) in doc.pages.iter().enumerate() {
-        let page_y_offset = (doc.height + page_gap) * page_idx as f64;
+        let (off_x, off_y) = match layout {
+            PageLayout::Vertical => (0.0, page_idx as f64 * (doc.height + page_gap)),
+            PageLayout::Horizontal => (page_idx as f64 * (doc.width + page_gap), 0.0),
+        };
 
         cr.save().unwrap();
-        cr.translate(0.0, page_y_offset * SCALE);
+        cr.translate(off_x * SCALE, off_y * SCALE);
 
         cr.set_source_rgb(1.0, 1.0, 1.0);
         cr.rectangle(0.0, 0.0, doc.width * SCALE, doc.height * SCALE);
@@ -1018,7 +1150,6 @@ fn draw_canvas(
         for item in &page.items {
             let is_selected = selected_id.as_ref() == Some(&item.id);
             let is_editing_this = is_selected && is_editing;
-            let item_selection = if is_editing_this { selection } else { None };
 
             cr.save().unwrap();
             cr.translate(item.x * SCALE, item.y * SCALE);
@@ -1026,10 +1157,10 @@ fn draw_canvas(
 
             match item.item_type {
                 ItemType::TextFrame => {
-                    draw_text_frame(cr, item, is_selected, is_editing_this, cursor_pos, item_selection);
+                    draw_text_frame(cr, item, is_selected, is_editing_this);
                 }
                 ItemType::ImageFrame => {
-                    let image = item.image_path.as_ref()
+                    let image = item.image_box.image_path.as_ref()
                         .and_then(|p| images.get(p))
                         .map(|rc| rc.as_ref());
                     draw_image_frame(cr, item, is_selected, image);
@@ -1039,7 +1170,7 @@ fn draw_canvas(
 
             cr.restore().unwrap();
 
-            if is_selected && !is_editing {
+            if is_selected && !is_editing_this {
                 let handles = get_handle_positions(item);
                 cr.set_source_rgb(1.0, 1.0, 1.0);
                 for (hx, hy) in &handles {
@@ -1076,76 +1207,10 @@ fn draw_text_frame(
     item: &Item,
     is_selected: bool,
     is_editing: bool,
-    cursor_pos: usize,
-    selection: Option<(usize, usize)>,
 ) {
     let w = item.width * SCALE;
     let h = item.height * SCALE;
-
-    if is_editing {
-        cr.set_source_rgb(0.97, 0.97, 1.0);
-        cr.rectangle(0.0, 0.0, w, h);
-        cr.fill().unwrap();
-    }
-
-    if is_selected {
-        cr.set_source_rgb(0.0, 0.5, 1.0);
-        cr.set_line_width(2.0);
-    } else {
-        cr.set_source_rgb(0.3, 0.3, 0.3);
-        cr.set_line_width(1.0);
-    }
-    cr.rectangle(0.0, 0.0, w, h);
-    cr.stroke().unwrap();
-
-    cr.rectangle(1.0, 1.0, w - 2.0, h - 2.0);
-    cr.clip();
-
-    let pscale = gtk::pango::SCALE as f64;
-    let layout = pangocairo::functions::create_layout(cr);
-    layout.set_text(&item.text);
-    let font_desc = gtk::pango::FontDescription::from_string("Sans 11");
-    layout.set_font_description(Some(&font_desc));
-    layout.set_width(((w - 2.0 * TEXT_PAD) * pscale) as i32);
-    layout.set_wrap(gtk::pango::WrapMode::Word);
-
-    if let Some((sel_start, sel_end)) = selection {
-        if sel_start < sel_end && sel_end <= item.text.len() {
-            let attrs = gtk::pango::AttrList::new();
-
-            let mut bg: gtk::pango::Attribute =
-                gtk::pango::AttrColor::new_background(0x3535, 0x8484, 0xe4e4).into();
-            bg.set_start_index(sel_start as u32);
-            bg.set_end_index(sel_end as u32);
-            attrs.insert(bg);
-
-            let mut fg: gtk::pango::Attribute =
-                gtk::pango::AttrColor::new_foreground(0xffff, 0xffff, 0xffff).into();
-            fg.set_start_index(sel_start as u32);
-            fg.set_end_index(sel_end as u32);
-            attrs.insert(fg);
-
-            layout.set_attributes(Some(&attrs));
-        }
-    }
-
-    cr.set_source_rgb(0.1, 0.1, 0.1);
-    cr.move_to(TEXT_PAD, TEXT_PAD);
-    pangocairo::functions::show_layout(cr, &layout);
-
-    if is_editing && selection.is_none() {
-        let byte_idx = cursor_pos.min(item.text.len()) as i32;
-        let (strong, _) = layout.cursor_pos(byte_idx);
-        let cx = TEXT_PAD + strong.x() as f64 / pscale;
-        let cy = TEXT_PAD + strong.y() as f64 / pscale;
-        let ch = strong.height() as f64 / pscale;
-
-        cr.set_source_rgb(0.1, 0.1, 0.9);
-        cr.set_line_width(1.5);
-        cr.move_to(cx, cy + 1.0);
-        cr.line_to(cx, cy + ch - 1.0);
-        cr.stroke().unwrap();
-    }
+    item.text_box.render(cr, w, h, is_selected, is_editing);
 }
 
 fn draw_image_frame(
@@ -1156,92 +1221,5 @@ fn draw_image_frame(
 ) {
     let w = item.width * SCALE;
     let h = item.height * SCALE;
-
-    // Background
-    cr.set_source_rgb(0.88, 0.88, 0.88);
-    cr.rectangle(0.0, 0.0, w, h);
-    cr.fill().unwrap();
-
-    if let Some(surf) = image {
-        cr.save().unwrap();
-        cr.rectangle(0.0, 0.0, w, h);
-        cr.clip();
-
-        let img_w = surf.width() as f64;
-        let img_h = surf.height() as f64;
-        let sx = w / img_w;
-        let sy = h / img_h;
-        cr.scale(sx, sy);
-        cr.set_source_surface(surf, 0.0, 0.0).unwrap();
-        cr.paint().unwrap();
-        cr.restore().unwrap();
-    } else {
-        // Placeholder: diagonal hatch
-        cr.save().unwrap();
-        cr.rectangle(0.0, 0.0, w, h);
-        cr.clip();
-        cr.set_source_rgb(0.75, 0.75, 0.75);
-        cr.set_line_width(1.0);
-        let step = 12.0_f64;
-        let diag = w + h;
-        let mut i = -h;
-        while i < diag {
-            cr.move_to(i, 0.0);
-            cr.line_to(i + h, h);
-            i += step;
-        }
-        cr.stroke().unwrap();
-        cr.restore().unwrap();
-
-        // Centre label
-        let layout = pangocairo::functions::create_layout(cr);
-        layout.set_text("Image");
-        layout.set_font_description(Some(&gtk::pango::FontDescription::from_string("Sans 10")));
-        let (pw, ph) = layout.pixel_size();
-        if pw as f64 <= w && ph as f64 <= h {
-            cr.set_source_rgb(0.45, 0.45, 0.45);
-            cr.move_to((w - pw as f64) / 2.0, (h - ph as f64) / 2.0);
-            pangocairo::functions::show_layout(cr, &layout);
-        }
-    }
-
-    // Border
-    if is_selected {
-        cr.set_source_rgb(0.0, 0.5, 1.0);
-        cr.set_line_width(2.0);
-    } else {
-        cr.set_source_rgb(0.3, 0.3, 0.3);
-        cr.set_line_width(1.0);
-    }
-    cr.rectangle(0.0, 0.0, w, h);
-    cr.stroke().unwrap();
-}
-
-fn hit_test_layout(item: &Item, click_x_mm: f64, click_y_mm: f64) -> usize {
-    use gtk::pango::prelude::FontMapExt;
-
-    let pscale = gtk::pango::SCALE as f64;
-    let frame_w_px = item.width * SCALE;
-
-    let font_map = pangocairo::FontMap::default();
-    let context = font_map.create_context();
-    let layout = gtk::pango::Layout::new(&context);
-    layout.set_text(&item.text);
-    layout.set_font_description(Some(&gtk::pango::FontDescription::from_string("Sans 11")));
-    layout.set_width(((frame_w_px - 2.0 * TEXT_PAD) * pscale) as i32);
-    layout.set_wrap(gtk::pango::WrapMode::Word);
-
-    let rel_x = (click_x_mm - item.x) * SCALE - TEXT_PAD;
-    let rel_y = (click_y_mm - item.y) * SCALE - TEXT_PAD;
-    let x_pango = (rel_x * pscale).max(0.0) as i32;
-    let y_pango = (rel_y * pscale).max(0.0) as i32;
-
-    let (_inside, byte_idx, trailing) = layout.xy_to_index(x_pango, y_pango);
-    let byte_idx = byte_idx as usize;
-
-    if trailing > 0 && byte_idx < item.text.len() {
-        next_char_boundary(&item.text, byte_idx)
-    } else {
-        byte_idx
-    }
+    item.image_box.render(cr, w, h, is_selected, image);
 }

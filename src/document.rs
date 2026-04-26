@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use crate::text_box::TextBox;
 use crate::image_box::ImageBox;
+use crate::svg_box::SvgBox;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
@@ -23,15 +24,33 @@ pub struct Item {
     pub width: f64,
     pub height: f64,
     pub rotation: f64,
-    pub item_type: ItemType,
-    pub text_box: TextBox,
-    pub image_box: ImageBox,
+    pub content: ItemContent,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ItemContent {
+    Text(TextBox),
+    Image(ImageBox),
+    Svg(SvgBox),
+    Shape,
+}
+
+impl ItemContent {
+    pub fn item_type(&self) -> ItemType {
+        match self {
+            ItemContent::Text(_) => ItemType::TextFrame,
+            ItemContent::Image(_) => ItemType::ImageFrame,
+            ItemContent::Svg(_) => ItemType::SvgFrame,
+            ItemContent::Shape => ItemType::Shape,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ItemType {
     TextFrame,
     ImageFrame,
+    SvgFrame,
     Shape,
 }
 
@@ -56,15 +75,13 @@ impl Default for Document {
                             width: 170.0,
                             height: 50.0,
                             rotation: 0.0,
-                            item_type: ItemType::TextFrame,
-                            text_box: TextBox::new("Sample text for the first frame.".to_string()),
-                            image_box: ImageBox::default(),
+                            content: ItemContent::Text(TextBox::new("Sample text for the first frame.".to_string())),
                         }
                     ],
                 }
             ],
-            width: 210.0,  // A4 width in mm
-            height: 297.0, // A4 height in mm
+            width: 210.0,
+            height: 297.0,
         }
     }
 }

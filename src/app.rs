@@ -1,11 +1,14 @@
 use relm4::prelude::*;
 use adw::prelude::*;
 use gtk::gdk;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use crate::document::{Document, Item, ItemType};
+use crate::document::{Document, Item, ItemContent, ItemType};
 use crate::text_box::{TextBox, KeyAction};
 use crate::image_box::{FitMode, ImageBox};
+use crate::svg_box::SvgBox;
+use crate::persistence::PersistenceManager;
 
 const SCALE: f64 = 3.0;
 
@@ -32,7 +35,11 @@ pub struct AppModel {
     zoom: f64,
     create_frame_type: ItemType,
     image_surfaces: HashMap<String, Rc<cairo::ImageSurface>>,
+    svg_handles: HashMap<String, Rc<rsvg::SvgHandle>>,
+    svg_editor_path: Option<String>,
     page_layout: PageLayout,
+    last_save_path: Option<String>,
+    editing_flag: Rc<RefCell<bool>>,
 }
 
 impl AppModel {
@@ -60,13 +67,16 @@ impl AppModel {
 
     fn selected_item_type(&self) -> Option<ItemType> {
         let id = self.selected_item_id.as_ref()?;
-        self.find_item(id).map(|(_, item)| item.item_type)
+        self.find_item(id).map(|(_, item)| item.content.item_type())
     }
 
     fn get_editing_text_box_mut(&mut self) -> Option<&mut TextBox> {
         let id = self.selected_item_id.clone()?;
         let (_, item) = self.find_item_mut(&id)?;
-        (item.item_type == ItemType::TextFrame).then_some(&mut item.text_box)
+        match &mut item.content {
+            ItemContent::Text(tb) => Some(tb),
+            _ => None,
+        }
     }
 
     fn get_page_offset(&self, page_idx: usize) -> (f64, f64) {
@@ -128,9 +138,27 @@ pub enum AppInput {
     FitFrameToImage,
     FitImageToFrame,
     SetImageFitMode(crate::image_box::FitMode),
+    ImportSvg,
+    SvgLoaded(String),
+    ScrollText(f64),
+    SetSvgFitMode(crate::svg_box::FitMode),
+    FitFrameToSvg,
+    RefreshSvg,
+    ChooseSvgEditor,
+    SvgEditorChosen(String),
+    OpenExternalEditor,
+    BringToFront,
+    SendToBack,
+    BringForward,
+    SendBackward,
     DeleteItem,
     SetPageLayout(PageLayout),
     ShowPreferences,
+    SaveProject,
+    OpenProject,
+    ExportPdf,
+    ProjectSaved(String),
+    ProjectLoaded(Document, String),
 }
 
 #[derive(Debug)]
@@ -163,6 +191,21 @@ impl Component for AppModel {
                         set_icon_name: "list-add-symbolic",
                         set_tooltip_text: Some("Add Page"),
                         connect_clicked => AppInput::AddPage,
+                    },
+                    pack_start = &gtk::Button {
+                        set_icon_name: "document-open-symbolic",
+                        set_tooltip_text: Some("Open Project"),
+                        connect_clicked => AppInput::OpenProject,
+                    },
+                    pack_start = &gtk::Button {
+                        set_icon_name: "document-save-symbolic",
+                        set_tooltip_text: Some("Save Project"),
+                        connect_clicked => AppInput::SaveProject,
+                    },
+                    pack_start = &gtk::Button {
+                        set_icon_name: "printer-symbolic",
+                        set_tooltip_text: Some("Export to PDF"),
+                        connect_clicked => AppInput::ExportPdf,
                     },
                     pack_end = &gtk::MenuButton {
                         set_icon_name: "open-menu-symbolic",
@@ -259,6 +302,16 @@ impl Component for AppModel {
                                     }
                                 },
                             },
+                            gtk::ToggleButton {
+                                set_label: "SVG",
+                                #[watch]
+                                set_active: model.create_frame_type == ItemType::SvgFrame,
+                                connect_toggled[sender] => move |btn| {
+                                    if btn.is_active() {
+                                        sender.input(AppInput::SetCreateFrameType(ItemType::SvgFrame));
+                                    }
+                                },
+                            },
                         },
                         gtk::Separator {},
                         gtk::Label {
@@ -280,6 +333,12 @@ impl Component for AppModel {
                             #[watch]
                             set_visible: model.selected_item_type() == Some(ItemType::ImageFrame),
                             connect_clicked => AppInput::ImportImage,
+                        },
+                        gtk::Button {
+                            set_label: "Import SVG",
+                            #[watch]
+                            set_visible: model.selected_item_type() == Some(ItemType::SvgFrame),
+                            connect_clicked => AppInput::ImportSvg,
                         },
                     },
 
@@ -332,8 +391,9 @@ impl Component for AppModel {
                                         let zoom = model.zoom;
                                         let layout = model.page_layout;
                                         let images = model.image_surfaces.clone();
+                                        let svgs = model.svg_handles.clone();
                                         move |_area, cr, _w, _h| {
-                                            draw_canvas(cr, &doc, d_start, d_current, selected.clone(), editing, &images, zoom, layout);
+                                            draw_canvas(cr, &doc, d_start, d_current, selected.clone(), editing, &images, &svgs, zoom, layout);
                                         }
                                     },
 
@@ -370,10 +430,13 @@ impl Component for AppModel {
 
                                     add_controller = gtk::EventControllerScroll {
                                         set_flags: gtk::EventControllerScrollFlags::VERTICAL,
-                                        connect_scroll[sender] => move |ctrl, _dx, dy| {
+                                        connect_scroll[sender, editing_flag = model.editing_flag.clone()] => move |ctrl, _dx, dy| {
                                             let state = ctrl.current_event().map(|e| e.modifier_state()).unwrap_or(gdk::ModifierType::empty());
                                             if state.contains(gdk::ModifierType::CONTROL_MASK) {
                                                 sender.input(AppInput::Zoom(-dy));
+                                                gtk::glib::Propagation::Stop
+                                            } else if *editing_flag.borrow() {
+                                                sender.input(AppInput::ScrollText(dy));
                                                 gtk::glib::Propagation::Stop
                                             } else {
                                                 gtk::glib::Propagation::Proceed
@@ -466,7 +529,6 @@ impl Component for AppModel {
                                                 connect_toggled[sender] => move |btn| {
                                                     if btn.is_active() {
                                                         sender.input(AppInput::SetImageFitMode(crate::image_box::FitMode::FrameToImage));
-                                                        sender.input(AppInput::FitFrameToImage);
                                                     }
                                                 },
                                             },
@@ -476,6 +538,141 @@ impl Component for AppModel {
                                             #[watch]
                                             set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_id),
                                             connect_clicked => AppInput::FitFrameToImage,
+                                        },
+
+                                        // SvgFrame actions
+                                        gtk::Button {
+                                            set_label: "Import SVG",
+                                            add_css_class: "suggested-action",
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            connect_clicked => AppInput::ImportSvg,
+                                        },
+
+                                        // SVG Fit Mode section
+                                        gtk::Separator {
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                        },
+                                        gtk::Label {
+                                            set_label: "SVG Fit Mode",
+                                            add_css_class: "heading",
+                                            set_xalign: 0.0,
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                        },
+                                        gtk::Box {
+                                            set_orientation: gtk::Orientation::Horizontal,
+                                            set_spacing: 4,
+                                            add_css_class: "linked",
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+
+                                            gtk::ToggleButton {
+                                                set_label: "Prop.",
+                                                #[watch]
+                                                set_active: get_selected_svg_fit_mode(&model.document, &model.selected_item_id) == Some(crate::svg_box::FitMode::Proportional),
+                                                connect_toggled[sender] => move |btn| {
+                                                    if btn.is_active() {
+                                                        sender.input(AppInput::SetSvgFitMode(crate::svg_box::FitMode::Proportional));
+                                                    }
+                                                },
+                                            },
+                                            gtk::ToggleButton {
+                                                set_label: "Original",
+                                                #[watch]
+                                                set_active: get_selected_svg_fit_mode(&model.document, &model.selected_item_id) == Some(crate::svg_box::FitMode::Original),
+                                                connect_toggled[sender] => move |btn| {
+                                                    if btn.is_active() {
+                                                        sender.input(AppInput::SetSvgFitMode(crate::svg_box::FitMode::Original));
+                                                    }
+                                                },
+                                            },
+                                            gtk::ToggleButton {
+                                                set_label: "Stretch",
+                                                #[watch]
+                                                set_active: get_selected_svg_fit_mode(&model.document, &model.selected_item_id) == Some(crate::svg_box::FitMode::Stretch),
+                                                connect_toggled[sender] => move |btn| {
+                                                    if btn.is_active() {
+                                                        sender.input(AppInput::SetSvgFitMode(crate::svg_box::FitMode::Stretch));
+                                                    }
+                                                },
+                                            },
+                                        },
+                                        gtk::Button {
+                                            set_label: "Fit Frame to SVG",
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            connect_clicked => AppInput::FitFrameToSvg,
+                                        },
+                                        gtk::Button {
+                                            set_label: "Refresh SVG",
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            connect_clicked => AppInput::RefreshSvg,
+                                        },
+                                        gtk::Button {
+                                            set_label: "Open in External Editor",
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            connect_clicked => AppInput::OpenExternalEditor,
+                                        },
+                                        gtk::Button {
+                                            #[watch]
+                                            set_label: if model.svg_editor_path.is_some() { "Change SVG Editor" } else { "Set SVG Editor Path" },
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            connect_clicked => AppInput::ChooseSvgEditor,
+                                        },
+                                        gtk::Label {
+                                            #[watch]
+                                            set_label: &get_svg_path_info(&model.document, &model.selected_item_id),
+                                            set_ellipsize: gtk::pango::EllipsizeMode::Middle,
+                                            set_max_width_chars: 40,
+                                            add_css_class: "caption",
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                        },
+
+                                        // Z-Order section
+                                        gtk::Separator {
+                                            #[watch]
+                                            set_visible: model.selected_item_id.is_some(),
+                                        },
+                                        gtk::Label {
+                                            set_label: "Z-Order",
+                                            add_css_class: "heading",
+                                            set_xalign: 0.0,
+                                            #[watch]
+                                            set_visible: model.selected_item_id.is_some(),
+                                        },
+                                        gtk::Box {
+                                            set_orientation: gtk::Orientation::Horizontal,
+                                            set_spacing: 4,
+                                            add_css_class: "linked",
+                                            #[watch]
+                                            set_visible: model.selected_item_id.is_some(),
+
+                                            gtk::Button {
+                                                set_icon_name: "go-top-symbolic",
+                                                set_tooltip_text: Some("Bring to Front"),
+                                                connect_clicked => AppInput::BringToFront,
+                                            },
+                                            gtk::Button {
+                                                set_icon_name: "go-up-symbolic",
+                                                set_tooltip_text: Some("Bring Forward"),
+                                                connect_clicked => AppInput::BringForward,
+                                            },
+                                            gtk::Button {
+                                                set_icon_name: "go-down-symbolic",
+                                                set_tooltip_text: Some("Send Backward"),
+                                                connect_clicked => AppInput::SendBackward,
+                                            },
+                                            gtk::Button {
+                                                set_icon_name: "go-bottom-symbolic",
+                                                set_tooltip_text: Some("Send to Back"),
+                                                connect_clicked => AppInput::SendToBack,
+                                            },
                                         },
                                     }
                                 }
@@ -509,7 +706,11 @@ impl Component for AppModel {
             zoom: 1.0,
             create_frame_type: ItemType::TextFrame,
             image_surfaces: HashMap::new(),
+            svg_handles: HashMap::new(),
+            svg_editor_path: None,
             page_layout: PageLayout::Vertical,
+            last_save_path: None,
+            editing_flag: Rc::new(RefCell::new(false)),
         };
 
         let widgets = view_output!();
@@ -563,16 +764,31 @@ impl Component for AppModel {
                     if let Some(tb) = self.get_editing_text_box_mut() {
                         tb.cursor_pos = tb.text.len();
                         tb.selection_anchor = None;
+                        tb.scroll_y = 0.0;
                     }
                     self.is_editing = true;
+                    *self.editing_flag.borrow_mut() = true;
                     self.request_focus = true;
                     self.popover_visible = false;
+
+                    let item_dims = self.selected_item_id.as_ref()
+                        .and_then(|id| self.find_item(id))
+                        .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
+                    if let Some((w, h)) = item_dims {
+                        let pango_ctx = make_pango_ctx();
+                        if let Some(tb) = self.get_editing_text_box_mut() {
+                            let s = tb.ensure_cursor_visible(&pango_ctx, w, h, SCALE);
+                            tb.scroll_y = s;
+                        }
+                    }
                 }
             }
             AppInput::ExitEdit => {
                 self.is_editing = false;
+                *self.editing_flag.borrow_mut() = false;
                 if let Some(tb) = self.get_editing_text_box_mut() {
                     tb.selection_anchor = None;
+                    tb.scroll_y = 0.0;
                 }
             }
             AppInput::ImportImage => {
@@ -605,7 +821,9 @@ impl Component for AppModel {
                 }
                 if let Some(id) = self.selected_item_id.clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
-                        item.image_box.image_path = Some(path);
+                        if let ItemContent::Image(ib) = &mut item.content {
+                            ib.image_path = Some(path);
+                        }
                     }
                 }
                 self.popover_visible = false;
@@ -613,21 +831,23 @@ impl Component for AppModel {
             AppInput::FitFrameToImage => {
                 let id = self.selected_item_id.clone();
                 let item_data = id.as_ref().and_then(|id| self.find_item(id));
-                
+
                 if let Some((_page_idx, item)) = item_data {
-                    if let Some(path) = &item.image_box.image_path {
-                        if let Some(surface) = self.image_surfaces.get(path) {
-                            let img_w = surface.width() as f64;
-                            let img_h = surface.height() as f64;
-                            // Convert pixels → mm at 96 DPI
-                            let w_mm = img_w * 25.4 / 96.0;
-                            let h_mm = img_h * 25.4 / 96.0;
-                            
-                            // Re-fetch mutably to update
-                            if let Some((_, item_mut)) = self.find_item_mut(&item.id) {
-                                item_mut.width = w_mm;
-                                item_mut.height = h_mm;
-                                item_mut.image_box.fit_mode = FitMode::FrameToImage;
+                    if let ItemContent::Image(ib) = &item.content {
+                        if let Some(path) = &ib.image_path {
+                            if let Some(surface) = self.image_surfaces.get(path) {
+                                let img_w = surface.width() as f64;
+                                let img_h = surface.height() as f64;
+                                let w_mm = img_w * 25.4 / 96.0;
+                                let h_mm = img_h * 25.4 / 96.0;
+
+                                if let Some((_, item_mut)) = self.find_item_mut(&item.id) {
+                                    item_mut.width = w_mm;
+                                    item_mut.height = h_mm;
+                                    if let ItemContent::Image(ib_mut) = &mut item_mut.content {
+                                        ib_mut.fit_mode = FitMode::FrameToImage;
+                                    }
+                                }
                             }
                         }
                     }
@@ -637,15 +857,207 @@ impl Component for AppModel {
             AppInput::FitImageToFrame => {
                 if let Some(id) = self.selected_item_id.clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
-                        item.image_box.fit_mode = FitMode::ImageToFrame;
+                        if let ItemContent::Image(ib) = &mut item.content {
+                            ib.fit_mode = FitMode::ImageToFrame;
+                        }
                     }
                 }
                 self.popover_visible = false;
             }
             AppInput::SetImageFitMode(mode) => {
                 if let Some(id) = self.selected_item_id.clone() {
+                    let mut aspect_ratio = None;
+                    
+                    // 1. Get aspect ratio if we are switching to Proportional
+                    if mode == FitMode::FrameToImage {
+                        if let Some((_, item)) = self.find_item(&id) {
+                            if let ItemContent::Image(ib) = &item.content {
+                                if let Some(path) = &ib.image_path {
+                                    if let Some(surface) = self.image_surfaces.get(path) {
+                                        aspect_ratio = Some(surface.width() as f64 / surface.height() as f64);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 2. Apply mode and adjust dimensions if proportional
                     if let Some((_, item)) = self.find_item_mut(&id) {
-                        item.image_box.fit_mode = mode;
+                        if let ItemContent::Image(ib) = &mut item.content {
+                            ib.fit_mode = mode;
+                            if let Some(ratio) = aspect_ratio {
+                                if ratio > 0.0 {
+                                    item.height = item.width / ratio;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            AppInput::ImportSvg => {
+                if self.selected_item_id.is_some() {
+                    let dialog = gtk::FileDialog::new();
+                    let filter = gtk::FileFilter::new();
+                    filter.add_suffix("svg");
+                    filter.set_name(Some("SVG Images"));
+                    let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+                    filters.append(&filter);
+                    dialog.set_filters(Some(&filters));
+                    dialog.set_default_filter(Some(&filter));
+
+                    let s = sender.clone();
+                    let win = root.clone();
+                    gtk::glib::MainContext::default().spawn_local(async move {
+                        if let Ok(file) = dialog.open_future(Some(&win)).await {
+                            if let Some(path) = file.path() {
+                                s.input(AppInput::SvgLoaded(
+                                    path.to_string_lossy().to_string(),
+                                ));
+                            }
+                        }
+                    });
+                }
+            }
+            AppInput::SvgLoaded(path) => {
+                match rsvg::Loader::new().read_path(&path) {
+                    Ok(handle) => {
+                        self.svg_handles.insert(path.clone(), Rc::new(handle));
+                        if let Some(id) = self.selected_item_id.clone() {
+                            if let Some((_, item)) = self.find_item_mut(&id) {
+                                if let ItemContent::Svg(sb) = &mut item.content {
+                                    sb.svg_path = path;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("Failed to load SVG: {}", e),
+                }
+                self.popover_visible = false;
+            }
+            AppInput::SetSvgFitMode(mode) => {
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Svg(sb) = &mut item.content {
+                            sb.fit_mode = mode;
+                        }
+                    }
+                }
+            }
+            AppInput::FitFrameToSvg => {
+                let id = self.selected_item_id.clone();
+                let item_data = id.as_ref().and_then(|id| self.find_item(id));
+
+                if let Some((_page_idx, item)) = item_data {
+                    if let ItemContent::Svg(sb) = &item.content {
+                        if !sb.svg_path.is_empty() {
+                            let (w_mm, h_mm) = crate::svg_box::SvgBox::intrinsic_size(&sb.svg_path);
+                            if let Some((_, item_mut)) = self.find_item_mut(&item.id) {
+                                item_mut.width = w_mm;
+                                item_mut.height = h_mm;
+                            }
+                        }
+                    }
+                }
+                self.popover_visible = false;
+            }
+            AppInput::RefreshSvg => {
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item(&id) {
+                        if let ItemContent::Svg(sb) = &item.content {
+                            let path = sb.svg_path.clone();
+                            if !path.is_empty() {
+                                match rsvg::Loader::new().read_path(&path) {
+                                    Ok(handle) => {
+                                        self.svg_handles.insert(path, Rc::new(handle));
+                                    }
+                                    Err(e) => eprintln!("Failed to refresh SVG: {}", e),
+                                }
+                            }
+                        }
+                    }
+                }
+                self.popover_visible = false;
+            }
+            AppInput::ChooseSvgEditor => {
+                let dialog = gtk::FileDialog::new();
+                dialog.set_title("Choose SVG Editor Executable");
+                let s = sender.clone();
+                let win = root.clone();
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    if let Ok(file) = dialog.open_future(Some(&win)).await {
+                        if let Some(path) = file.path() {
+                            s.input(AppInput::SvgEditorChosen(path.to_string_lossy().to_string()));
+                        }
+                    }
+                });
+            }
+            AppInput::SvgEditorChosen(path) => {
+                self.svg_editor_path = Some(path);
+            }
+            AppInput::OpenExternalEditor => {
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item(&id) {
+                        if let ItemContent::Svg(sb) = &item.content {
+                            let path = sb.svg_path.clone();
+                            if !path.is_empty() {
+                                if let Some(editor) = &self.svg_editor_path {
+                                    if let Err(e) = std::process::Command::new(editor).arg(&path).spawn() {
+                                        eprintln!("Failed to open SVG with custom editor: {}", e);
+                                    }
+                                } else {
+                                    if let Err(e) = open::that(&path) {
+                                        eprintln!("Failed to open SVG in external editor: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                self.popover_visible = false;
+            }
+            AppInput::BringToFront => {
+                if let Some(id) = self.selected_item_id.clone() {
+                    for page in &mut self.document.pages {
+                        if let Some(pos) = page.items.iter().position(|i| i.id == id) {
+                            let item = page.items.remove(pos);
+                            page.items.push(item);
+                            break;
+                        }
+                    }
+                }
+            }
+            AppInput::SendToBack => {
+                if let Some(id) = self.selected_item_id.clone() {
+                    for page in &mut self.document.pages {
+                        if let Some(pos) = page.items.iter().position(|i| i.id == id) {
+                            let item = page.items.remove(pos);
+                            page.items.insert(0, item);
+                            break;
+                        }
+                    }
+                }
+            }
+            AppInput::BringForward => {
+                if let Some(id) = self.selected_item_id.clone() {
+                    for page in &mut self.document.pages {
+                        if let Some(pos) = page.items.iter().position(|i| i.id == id) {
+                            if pos + 1 < page.items.len() {
+                                page.items.swap(pos, pos + 1);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            AppInput::SendBackward => {
+                if let Some(id) = self.selected_item_id.clone() {
+                    for page in &mut self.document.pages {
+                        if let Some(pos) = page.items.iter().position(|i| i.id == id) {
+                            if pos > 0 {
+                                page.items.swap(pos, pos - 1);
+                            }
+                            break;
+                        }
                     }
                 }
             }
@@ -671,6 +1083,16 @@ impl Component for AppModel {
                 if let Some(tb) = self.get_editing_text_box_mut() {
                     tb.insert_text(&text);
                 }
+                let item_dims = self.selected_item_id.as_ref()
+                    .and_then(|id| self.find_item(id))
+                    .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
+                if let Some((w, h)) = item_dims {
+                    let pango_ctx = make_pango_ctx();
+                    if let Some(tb) = self.get_editing_text_box_mut() {
+                        let s = tb.ensure_cursor_visible(&pango_ctx, w, h, SCALE);
+                        tb.scroll_y = s;
+                    }
+                }
             }
             AppInput::TextKeyPressed(key, state) => {
                 if !self.is_editing {
@@ -687,6 +1109,12 @@ impl Component for AppModel {
                 match action {
                     KeyAction::ExitEdit => {
                         self.is_editing = false;
+                        *self.editing_flag.borrow_mut() = false;
+                        if let Some(tb) = self.get_editing_text_box_mut() {
+                            tb.selection_anchor = None;
+                            tb.scroll_y = 0.0;
+                        }
+                        return;
                     }
                     KeyAction::RequestPaste => {
                         let s = sender.clone();
@@ -699,11 +1127,45 @@ impl Component for AppModel {
                             }
                         });
                     }
+                    KeyAction::MoveVertical { up, extend } => {
+                        let frame_w_px = self.selected_item_id.as_ref()
+                            .and_then(|id| self.find_item(id))
+                            .map(|(_, item)| item.width * SCALE)
+                            .unwrap_or(0.0);
+                        if let Some(tb) = self.get_editing_text_box_mut() {
+                            tb.move_cursor_vertical(up, extend, frame_w_px, SCALE);
+                        }
+                    }
                     KeyAction::Handled => {}
+                }
+
+                let item_dims = self.selected_item_id.as_ref()
+                    .and_then(|id| self.find_item(id))
+                    .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
+                if let Some((w, h)) = item_dims {
+                    let pango_ctx = make_pango_ctx();
+                    if let Some(tb) = self.get_editing_text_box_mut() {
+                        let s = tb.ensure_cursor_visible(&pango_ctx, w, h, SCALE);
+                        tb.scroll_y = s;
+                    }
                 }
             }
             AppInput::Zoom(delta) => {
                 self.zoom = (self.zoom + delta * 0.1).clamp(0.1, 5.0);
+            }
+            AppInput::ScrollText(dy) => {
+                if !self.is_editing { return; }
+                let item_dims = self.selected_item_id.as_ref()
+                    .and_then(|id| self.find_item(id))
+                    .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
+                if let Some((w, h)) = item_dims {
+                    let pango_ctx = make_pango_ctx();
+                    if let Some(tb) = self.get_editing_text_box_mut() {
+                        let total_h = tb.required_height(&pango_ctx, w, SCALE);
+                        let max_scroll = (total_h - h).max(0.0);
+                        tb.scroll_y = (tb.scroll_y + dy * 40.0).clamp(0.0, max_scroll);
+                    }
+                }
             }
             AppInput::DragStart(x, y) => {
                 let x_mm = x / self.scale();
@@ -711,11 +1173,13 @@ impl Component for AppModel {
 
                 if self.is_editing {
                     if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
-                        if item.item_type == ItemType::TextFrame && Some(item.id.clone()) == self.selected_item_id {
+                        if item.content.item_type() == ItemType::TextFrame && Some(item.id.clone()) == self.selected_item_id {
                             let (off_x, off_y) = self.get_page_offset(page_idx);
                             let local_x = x_mm - off_x;
                             let local_y = y_mm - off_y;
-                            let pos = item.text_box.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE);
+                            let pos = if let ItemContent::Text(ref tb) = item.content {
+                                tb.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                            } else { 0 };
                             
                             if let Some(tb) = self.get_editing_text_box_mut() {
                                 tb.cursor_pos = pos;
@@ -728,8 +1192,10 @@ impl Component for AppModel {
                         }
                     }
                     self.is_editing = false;
+                    *self.editing_flag.borrow_mut() = false;
                     if let Some(tb) = self.get_editing_text_box_mut() {
                         tb.selection_anchor = None;
+                        tb.scroll_y = 0.0;
                     }
                 }
 
@@ -799,13 +1265,19 @@ impl Component for AppModel {
                                 let (off_x, off_y) = self.get_page_offset(page_idx);
                                 let local_x = x_mm - off_x;
                                 let local_y = y_mm - off_y;
-                                item.text_box.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                                let pos = if let ItemContent::Text(ref tb) = item.content {
+                                    tb.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                                } else { 0 };
+                                (pos, item.width * SCALE, item.height * SCALE)
                             })
                         } else { None };
 
-                        if let Some(pos) = hit_data {
+                        if let Some((pos, w, h)) = hit_data {
+                            let pango_ctx = make_pango_ctx();
                             if let Some(tb) = self.get_editing_text_box_mut() {
                                 tb.cursor_pos = pos;
+                                let s = tb.ensure_cursor_visible(&pango_ctx, w, h, SCALE);
+                                tb.scroll_y = s;
                             }
                         }
                     }
@@ -828,10 +1300,12 @@ impl Component for AppModel {
 
                         // Pre-calculate image ratio if needed to avoid borrow checker issues
                         let image_ratio = if let Some((_, item)) = self.find_item(&id) {
-                            if item.item_type == ItemType::ImageFrame && item.image_box.fit_mode == FitMode::FrameToImage {
-                                item.image_box.image_path.as_ref().and_then(|path| {
-                                    self.image_surfaces.get(path).map(|surf| surf.width() as f64 / surf.height() as f64)
-                                })
+                            if let ItemContent::Image(ib) = &item.content {
+                                if ib.fit_mode == FitMode::FrameToImage {
+                                    ib.image_path.as_ref().and_then(|path| {
+                                        self.image_surfaces.get(path).map(|surf| surf.width() as f64 / surf.height() as f64)
+                                    })
+                                } else { None }
                             } else { None }
                         } else { None };
                         
@@ -942,13 +1416,43 @@ impl Component for AppModel {
                 let x_mm = x / self.scale();
                 let y_mm = y / self.scale();
 
+                // Check for double click on handles
+                if let Some(selected_id) = self.selected_item_id.clone() {
+                    if let Some((page_idx, item)) = self.find_item(&selected_id) {
+                        let (off_x, off_y) = self.get_page_offset(page_idx);
+                        let local_x = x_mm - off_x;
+                        let local_y = y_mm - off_y;
+                        
+                        let handles = get_handle_positions(&item);
+                        // Handle 5 is bottom center
+                        let (hx, hy) = handles[5]; 
+                        
+                        if (local_x - hx).abs() < 2.0 && (local_y - hy).abs() < 2.0 {
+                            if let ItemContent::Text(ref tb) = item.content {
+                                let font_map = pangocairo::FontMap::default();
+                                let pango_ctx = font_map.create_context();
+                                pangocairo::functions::context_set_resolution(&pango_ctx, 25.4 * SCALE);
+                                
+                                let required_height = tb.required_height(&pango_ctx, item.width * SCALE, SCALE);
+                                
+                                if let Some((_, item_mut)) = self.find_item_mut(&selected_id) {
+                                    item_mut.height = required_height / SCALE;
+                                }
+                                return;
+                            }
+                        }
+                    }
+                }
+
                 if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
                     let (off_x, off_y) = self.get_page_offset(page_idx);
                     let local_x = x_mm - off_x;
                     let local_y = y_mm - off_y;
-                    let click_pos = item.text_box.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE);
+                    let click_pos = if let ItemContent::Text(ref tb) = item.content {
+                        tb.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                    } else { 0 };
                     let id = item.id.clone();
-                    let item_type = item.item_type.clone();
+                    let item_type = item.content.item_type();
 
                     match item_type {
                         ItemType::TextFrame => {
@@ -957,6 +1461,7 @@ impl Component for AppModel {
                             self.selected_item_id = Some(id);
                             self.current_page = page_idx;
                             self.is_editing = true;
+                            *self.editing_flag.borrow_mut() = true;
                             self.request_focus = true;
 
                             if already_editing {
@@ -974,6 +1479,11 @@ impl Component for AppModel {
                             self.selected_item_id = Some(id);
                             self.current_page = page_idx;
                             sender.input(AppInput::ImportImage);
+                        }
+                        ItemType::SvgFrame => {
+                            self.selected_item_id = Some(id);
+                            self.current_page = page_idx;
+                            sender.input(AppInput::OpenExternalEditor);
                         }
                         _ => {}
                     }
@@ -1002,9 +1512,12 @@ impl Component for AppModel {
                                     id: new_id.clone(),
                                     x, y, width, height,
                                     rotation: 0.0,
-                                    item_type: self.create_frame_type.clone(),
-                                    text_box: TextBox::default(),
-                                    image_box: ImageBox::default(),
+                                    content: match self.create_frame_type {
+                                        ItemType::TextFrame => ItemContent::Text(TextBox::default()),
+                                        ItemType::ImageFrame => ItemContent::Image(ImageBox::default()),
+                                        ItemType::SvgFrame => ItemContent::Svg(SvgBox::default()),
+                                        ItemType::Shape => ItemContent::Shape,
+                                    },
                                 });
                                 self.selected_item_id = Some(new_id);
                             }
@@ -1018,8 +1531,146 @@ impl Component for AppModel {
                 self.is_moving = false;
                 self.request_focus = true;
             }
+            AppInput::SaveProject => {
+                let dialog = gtk::FileDialog::new();
+                let filter = gtk::FileFilter::new();
+                filter.add_pattern("*.rsp");
+                filter.set_name(Some("RScribus Project"));
+                let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+                dialog.set_filters(Some(&filters));
+                dialog.set_default_filter(Some(&filter));
+
+                if let Some(path) = &self.last_save_path {
+                    let file = gtk::gio::File::for_path(path);
+                    dialog.set_initial_file(Some(&file));
+                }
+
+                let s = sender.clone();
+                let win = root.clone();
+                let doc = self.document.clone();
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    if let Ok(file) = dialog.save_future(Some(&win)).await {
+                        if let Some(path) = file.path() {
+                            let mut path_str = path.to_string_lossy().to_string();
+                            if !path_str.ends_with(".rsp") {
+                                path_str.push_str(".rsp");
+                            }
+                            let save_path = std::path::Path::new(&path_str);
+                            if let Ok(_) = PersistenceManager::save_project(&doc, save_path) {
+                                s.input(AppInput::ProjectSaved(path_str));
+                            }
+                        }
+                    }
+                });
+            }
+            AppInput::ProjectSaved(path) => {
+                self.last_save_path = Some(path);
+                
+                let dialog = adw::MessageDialog::builder()
+                    .heading("Project Saved")
+                    .body("The project has been successfully saved.")
+                    .transient_for(root)
+                    .build();
+                dialog.add_response("ok", "OK");
+                dialog.present();
+            }
+            AppInput::OpenProject => {
+                let dialog = gtk::FileDialog::new();
+                let filter = gtk::FileFilter::new();
+                filter.add_pattern("*.rsp");
+                filter.set_name(Some("RScribus Project"));
+                let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+                dialog.set_filters(Some(&filters));
+                dialog.set_default_filter(Some(&filter));
+
+                let s = sender.clone();
+                let win = root.clone();
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    if let Ok(file) = dialog.open_future(Some(&win)).await {
+                        if let Some(path) = file.path() {
+                            let temp_dir = std::env::temp_dir().join("rscribus_extracted");
+                            if let Ok((doc, _)) = PersistenceManager::load_project(&path, &temp_dir) {
+                                s.input(AppInput::ProjectLoaded(doc, path.to_string_lossy().to_string()));
+                            }
+                        }
+                    }
+                });
+            }
+            AppInput::ExportPdf => {
+                let dialog = gtk::FileDialog::new();
+                let filter = gtk::FileFilter::new();
+                filter.add_pattern("*.pdf");
+                filter.set_name(Some("PDF Document"));
+                let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+                filters.append(&filter);
+                dialog.set_filters(Some(&filters));
+                dialog.set_default_filter(Some(&filter));
+
+                let s = sender.clone();
+                let win = root.clone();
+                let doc = self.document.clone();
+                let images = self.image_surfaces.clone();
+                let svgs = self.svg_handles.clone();
+                gtk::glib::MainContext::default().spawn_local(async move {
+                    if let Ok(file) = dialog.save_future(Some(&win)).await {
+                        if let Some(path) = file.path() {
+                            let mut path_str = path.to_string_lossy().to_string();
+                            if !path_str.ends_with(".pdf") {
+                                path_str.push_str(".pdf");
+                            }
+                            if let Ok(_) = export_to_pdf(&doc, &images, &svgs, &path_str) {
+                                let dialog = adw::MessageDialog::builder()
+                                    .heading("Export Successful")
+                                    .body("The document has been exported to PDF.")
+                                    .transient_for(&win)
+                                    .build();
+                                dialog.add_response("ok", "OK");
+                                dialog.present();
+                            }
+                        }
+                    }
+                });
+            }
+            AppInput::ProjectLoaded(doc, path) => {
+                self.document = doc;
+                self.last_save_path = Some(path);
+                self.selected_item_id = None;
+                self.is_editing = false;
+                
+                // Pre-load all images from the loaded document
+                for page in &self.document.pages {
+                    for item in &page.items {
+                        if let ItemContent::Image(ib) = &item.content {
+                            if let Some(path) = &ib.image_path {
+                                if !self.image_surfaces.contains_key(path) {
+                                    if let Some(surface) = ImageBox::load_surface(path) {
+                                        self.image_surfaces.insert(path.clone(), Rc::new(surface));
+                                    }
+                                }
+                            }
+                        }
+                        if let ItemContent::Svg(sb) = &item.content {
+                            if !sb.svg_path.is_empty() && !self.svg_handles.contains_key(&sb.svg_path) {
+                                if let Ok(handle) = rsvg::Loader::new().read_path(&sb.svg_path) {
+                                    self.svg_handles.insert(sb.svg_path.clone(), Rc::new(handle));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+fn make_pango_ctx() -> gtk::pango::Context {
+    use gtk::pango::prelude::FontMapExt;
+    let font_map = pangocairo::FontMap::default();
+    let ctx = font_map.create_context();
+    pangocairo::functions::context_set_resolution(&ctx, 25.4 * SCALE);
+    ctx
 }
 
 fn is_selected_type(doc: &Document, selected_id: &Option<String>, ty: &ItemType) -> bool {
@@ -1027,7 +1678,7 @@ fn is_selected_type(doc: &Document, selected_id: &Option<String>, ty: &ItemType)
         .and_then(|id| {
             for page in &doc.pages {
                 if let Some(item) = page.items.iter().find(|i| &i.id == id) {
-                    return Some(&item.item_type == ty);
+                    return Some(&item.content.item_type() == ty);
                 }
             }
             None
@@ -1040,7 +1691,7 @@ fn selected_image_frame_has_image(doc: &Document, selected_id: &Option<String>) 
         .and_then(|id| {
             for page in &doc.pages {
                 if let Some(item) = page.items.iter().find(|i| &i.id == id) {
-                    return Some(item.item_type == ItemType::ImageFrame && item.image_box.image_path.is_some());
+                    return Some(matches!(&item.content, ItemContent::Image(ib) if ib.image_path.is_some()));
                 }
             }
             None
@@ -1052,20 +1703,50 @@ fn get_selected_fit_mode(doc: &Document, selected_id: &Option<String>) -> Option
     selected_id.as_ref().and_then(|id| {
         for page in &doc.pages {
             if let Some(item) = page.items.iter().find(|i| &i.id == id) {
-                return Some(item.image_box.fit_mode);
+                if let ItemContent::Image(ib) = &item.content {
+                    return Some(ib.fit_mode);
+                }
+                return None;
             }
         }
         None
     })
 }
 
+fn get_selected_svg_fit_mode(doc: &Document, selected_id: &Option<String>) -> Option<crate::svg_box::FitMode> {
+    selected_id.as_ref().and_then(|id| {
+        for page in &doc.pages {
+            if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+                if let ItemContent::Svg(sb) = &item.content {
+                    return Some(sb.fit_mode);
+                }
+                return None;
+            }
+        }
+        None
+    })
+}
+
+fn get_svg_path_info(doc: &Document, selected_id: &Option<String>) -> String {
+    selected_id.as_ref().and_then(|id| {
+        for page in &doc.pages {
+            if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+                if let ItemContent::Svg(sb) = &item.content {
+                    return Some(format!("Current path: {}", sb.svg_path));
+                }
+            }
+        }
+        None
+    }).unwrap_or_default()
+}
+
 fn get_info_text(doc: &Document, selected_id: &Option<String>) -> String {
     if let Some(id) = selected_id {
         for page in &doc.pages {
             if let Some(item) = page.items.iter().find(|i| &i.id == id) {
-                return match &item.item_type {
-                    ItemType::TextFrame => {
-                        let text = &item.text_box.text;
+                return match &item.content {
+                    ItemContent::Text(tb) => {
+                        let text = &tb.text;
                         let paragraphs = text.split('\n').filter(|s| !s.is_empty()).count();
                         let words = text.split_whitespace().count();
                         let characters = text.len();
@@ -1075,14 +1756,22 @@ fn get_info_text(doc: &Document, selected_id: &Option<String>) -> String {
                             item.width, item.height, paragraphs, lines, words, characters
                         )
                     }
-                    ItemType::ImageFrame => {
-                        let image_info = item.image_box.image_path.as_ref()
+                    ItemContent::Image(ib) => {
+                        let image_info = ib.image_path.as_ref()
                             .and_then(|p| std::path::Path::new(p).file_name())
                             .map(|n| format!("\nFile: {}", n.to_string_lossy()))
                             .unwrap_or_else(|| "\nNo image loaded".to_string());
                         format!("Type: Image Frame\nSize: {:.1}x{:.1}mm{}", item.width, item.height, image_info)
                     }
-                    ItemType::Shape => format!("Type: Shape\nSize: {:.1}x{:.1}mm", item.width, item.height),
+                    ItemContent::Svg(sb) => {
+                        let svg_info = if sb.svg_path.is_empty() {
+                            "\nNo SVG loaded".to_string()
+                        } else {
+                            format!("\nFile: {}", std::path::Path::new(&sb.svg_path).file_name().unwrap_or_default().to_string_lossy())
+                        };
+                        format!("Type: SVG Frame\nSize: {:.1}x{:.1}mm{}", item.width, item.height, svg_info)
+                    }
+                    ItemContent::Shape => format!("Type: Shape\nSize: {:.1}x{:.1}mm", item.width, item.height),
                 };
             }
         }
@@ -1105,6 +1794,67 @@ fn get_handle_positions(item: &Item) -> [(f64, f64); 8] {
 }
 
 
+fn draw_page_content(
+    cr: &cairo::Context,
+    pango_ctx: &gtk::pango::Context,
+    page: &crate::document::Page,
+    images: &HashMap<String, Rc<cairo::ImageSurface>>,
+    svg_handles: &HashMap<String, Rc<rsvg::SvgHandle>>,
+    selected_id: Option<&String>,
+    is_editing: bool,
+    draw_handles: bool,
+    scale_factor: f64,
+) {
+    for item in &page.items {
+        let is_selected = selected_id == Some(&item.id);
+        let is_editing_this = is_selected && is_editing;
+
+        cr.save().unwrap();
+        cr.translate(item.x * scale_factor, item.y * scale_factor);
+        cr.rotate(item.rotation.to_radians());
+
+        let w = item.width * scale_factor;
+        let h = item.height * scale_factor;
+        match &item.content {
+            ItemContent::Text(tb) => {
+                tb.render(cr, pango_ctx, w, h, is_selected, is_editing_this, scale_factor);
+            }
+            ItemContent::Image(ib) => {
+                let image = ib.image_path.as_ref()
+                    .and_then(|p| images.get(p))
+                    .map(|rc| rc.as_ref());
+                ib.render(cr, w, h, is_selected, image);
+            }
+            ItemContent::Svg(sb) => {
+                let handle = if sb.svg_path.is_empty() {
+                    None
+                } else {
+                    svg_handles.get(&sb.svg_path).map(|rc| rc.as_ref())
+                };
+                sb.render(cr, w, h, is_selected, handle);
+            }
+            ItemContent::Shape => {}
+        }
+
+        cr.restore().unwrap();
+
+        if draw_handles && is_selected && !is_editing_this {
+            let handles = get_handle_positions(item);
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            for (hx, hy) in &handles {
+                cr.rectangle(hx * scale_factor - 3.0, hy * scale_factor - 3.0, 6.0, 6.0);
+                cr.fill().unwrap();
+            }
+            cr.set_source_rgb(0.0, 0.5, 1.0);
+            cr.set_line_width(1.0);
+            for (hx, hy) in &handles {
+                cr.rectangle(hx * scale_factor - 3.0, hy * scale_factor - 3.0, 6.0, 6.0);
+                cr.stroke().unwrap();
+            }
+        }
+    }
+}
+
 fn draw_canvas(
     cr: &gtk::cairo::Context,
     doc: &Document,
@@ -1113,11 +1863,17 @@ fn draw_canvas(
     selected_id: Option<String>,
     is_editing: bool,
     images: &HashMap<String, Rc<cairo::ImageSurface>>,
+    svg_handles: &HashMap<String, Rc<rsvg::SvgHandle>>,
     zoom: f64,
     layout: PageLayout,
 ) {
     cr.save().unwrap();
     cr.scale(zoom, zoom);
+
+    // Set resolution for Pango to match our SCALE (3px = 1mm)
+    // 25.4 mm/inch * 3.0 px/mm = 76.2 DPI
+    let pango_ctx = pangocairo::functions::create_context(cr);
+    pangocairo::functions::context_set_resolution(&pango_ctx, 25.4 * SCALE);
 
     let page_gap = 20.0;
     for (page_idx, page) in doc.pages.iter().enumerate() {
@@ -1129,15 +1885,18 @@ fn draw_canvas(
         cr.save().unwrap();
         cr.translate(off_x * SCALE, off_y * SCALE);
 
+        // Page background
         cr.set_source_rgb(1.0, 1.0, 1.0);
         cr.rectangle(0.0, 0.0, doc.width * SCALE, doc.height * SCALE);
         cr.fill().unwrap();
 
+        // Page border
         cr.set_source_rgb(0.8, 0.8, 0.8);
         cr.set_line_width(1.0);
         cr.rectangle(0.0, 0.0, doc.width * SCALE, doc.height * SCALE);
         cr.stroke().unwrap();
 
+        // Margins (visual guide)
         cr.set_source_rgb(0.0, 0.5, 1.0);
         cr.set_dash(&[5.0, 5.0], 0.0);
         cr.rectangle(
@@ -1147,44 +1906,8 @@ fn draw_canvas(
         cr.stroke().unwrap();
         cr.set_dash(&[], 0.0);
 
-        for item in &page.items {
-            let is_selected = selected_id.as_ref() == Some(&item.id);
-            let is_editing_this = is_selected && is_editing;
+        draw_page_content(cr, &pango_ctx, page, images, svg_handles, selected_id.as_ref(), is_editing, true, SCALE);
 
-            cr.save().unwrap();
-            cr.translate(item.x * SCALE, item.y * SCALE);
-            cr.rotate(item.rotation.to_radians());
-
-            match item.item_type {
-                ItemType::TextFrame => {
-                    draw_text_frame(cr, item, is_selected, is_editing_this);
-                }
-                ItemType::ImageFrame => {
-                    let image = item.image_box.image_path.as_ref()
-                        .and_then(|p| images.get(p))
-                        .map(|rc| rc.as_ref());
-                    draw_image_frame(cr, item, is_selected, image);
-                }
-                ItemType::Shape => {}
-            }
-
-            cr.restore().unwrap();
-
-            if is_selected && !is_editing_this {
-                let handles = get_handle_positions(item);
-                cr.set_source_rgb(1.0, 1.0, 1.0);
-                for (hx, hy) in &handles {
-                    cr.rectangle(hx * SCALE - 3.0, hy * SCALE - 3.0, 6.0, 6.0);
-                    cr.fill().unwrap();
-                }
-                cr.set_source_rgb(0.0, 0.5, 1.0);
-                cr.set_line_width(1.0);
-                for (hx, hy) in &handles {
-                    cr.rectangle(hx * SCALE - 3.0, hy * SCALE - 3.0, 6.0, 6.0);
-                    cr.stroke().unwrap();
-                }
-            }
-        }
         cr.restore().unwrap();
     }
     cr.restore().unwrap();
@@ -1202,24 +1925,41 @@ fn draw_canvas(
     }
 }
 
-fn draw_text_frame(
-    cr: &gtk::cairo::Context,
-    item: &Item,
-    is_selected: bool,
-    is_editing: bool,
-) {
-    let w = item.width * SCALE;
-    let h = item.height * SCALE;
-    item.text_box.render(cr, w, h, is_selected, is_editing);
+pub fn export_to_pdf(
+    document: &Document,
+    images: &HashMap<String, Rc<cairo::ImageSurface>>,
+    svg_handles: &HashMap<String, Rc<rsvg::SvgHandle>>,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mm_to_points = 72.0 / 25.4;
+    let width_pt = document.width * mm_to_points;
+    let height_pt = document.height * mm_to_points;
+
+    let surface = cairo::PdfSurface::new(width_pt, height_pt, path)?;
+    let cr = cairo::Context::new(&surface)?;
+
+    // Set resolution for Pango to match our SCALE (3px = 1mm)
+    // 1 inch = 25.4 mm, so 25.4 * SCALE gives us the correct DPI for our coordinate system.
+    let pango_ctx = pangocairo::functions::create_context(&cr);
+    pangocairo::functions::context_set_resolution(&pango_ctx, 25.4 * SCALE);
+
+    for page in &document.pages {
+        surface.set_size(width_pt, height_pt)?;
+        cr.save()?;
+        // Map our internal units (pixels at SCALE) to PDF points.
+        // 1mm = SCALE pixels in our app.
+        // 1mm = 72/25.4 points in PDF.
+        // So 1 pixel = (72/25.4) / SCALE points.
+        let pdf_scale = mm_to_points / SCALE;
+        cr.scale(pdf_scale, pdf_scale);
+
+        draw_page_content(&cr, &pango_ctx, page, images, svg_handles, None, false, false, SCALE);
+
+        cr.restore()?;
+        cr.show_page()?;
+    }
+
+    surface.finish();
+    Ok(())
 }
 
-fn draw_image_frame(
-    cr: &gtk::cairo::Context,
-    item: &Item,
-    is_selected: bool,
-    image: Option<&cairo::ImageSurface>,
-) {
-    let w = item.width * SCALE;
-    let h = item.height * SCALE;
-    item.image_box.render(cr, w, h, is_selected, image);
-}

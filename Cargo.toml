@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cairo-rs = "0.22.0"
+cairo-rs = { version = "0.22.0", features = ["pdf"] }
 pangocairo = "0.22"
 gtk4 = { version = "0.11", features = ["v4_10"] }
 libadwaita = { version = "0.9.1", features = ["v1_6"] }
@@ -12,3 +12,6 @@ relm4 = { version = "0.11.0", features = ["libadwaita"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 uuid = { version = "1.23.1", features = ["v4"] }
+zip = "2.2.2"
+librsvg = "2.62.1"
+open = "5.1"

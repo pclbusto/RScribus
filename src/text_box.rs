@@ -57,6 +57,9 @@ pub enum KeyAction {
     ExitEdit,
     RequestPaste,
     MoveVertical { up: bool, extend: bool },
+    FormatBold,
+    FormatItalic,
+    FormatUnderline,
 }
 
 // ── TextBox ───────────────────────────────────────────────────────────────────
@@ -73,6 +76,15 @@ pub struct TextBox {
     /// Paragraph-level alignment.
     #[serde(default)]
     pub alignment: TextAlign,
+    /// ID of the next frame in the text chain.
+    #[serde(default)]
+    pub next_frame_id: Option<String>,
+    /// ID of the previous frame in the text chain.
+    #[serde(default)]
+    pub prev_frame_id: Option<String>,
+    /// Byte offset of this frame's text within the chain's global text.
+    #[serde(default)]
+    pub text_offset: usize,
     #[serde(skip)]
     pub cursor_pos: usize,
     #[serde(skip)]
@@ -90,6 +102,9 @@ impl Default for TextBox {
             line_spacing: 1.0,
             attributes: Vec::new(),
             alignment: TextAlign::default(),
+            next_frame_id: None,
+            prev_frame_id: None,
+            text_offset: 0,
             cursor_pos: 0,
             selection_anchor: None,
             scroll_y: 0.0,
@@ -212,6 +227,112 @@ impl TextBox {
 
     pub fn set_alignment(&mut self, align: TextAlign) { self.alignment = align; }
     pub fn get_alignment(&self) -> TextAlign { self.alignment }
+
+    pub fn set_line_spacing(&mut self, factor: f64) { self.line_spacing = factor; }
+    pub fn get_line_spacing(&self) -> f64 { self.line_spacing }
+
+    /// Selection range if active, otherwise the word boundaries around the cursor.
+    pub fn selection_or_word_range(&self) -> (usize, usize) {
+        if let Some(range) = self.selection_range() {
+            return range;
+        }
+        let pos = self.cursor_pos.min(self.text.len());
+        let start = {
+            let mut i = pos;
+            while i > 0 {
+                let prev = prev_char_boundary(&self.text, i);
+                if self.text[prev..i].chars().next().map_or(true, |c| c.is_whitespace()) { break; }
+                i = prev;
+            }
+            i
+        };
+        let end = {
+            let mut i = pos;
+            while i < self.text.len() {
+                let next = next_char_boundary(&self.text, i);
+                if self.text[i..next].chars().next().map_or(true, |c| c.is_whitespace()) { break; }
+                i = next;
+            }
+            i
+        };
+        (start, end)
+    }
+
+    /// Like `get_attr_at` but fills in family/size/bold/italic from `font_description`
+    /// when no explicit attribute overrides them, so the result always reflects the
+    /// effective (visible) format at that position.
+    pub fn effective_snapshot_at(&self, pos: usize) -> AttrSnapshot {
+        let mut snap = self.get_attr_at(pos);
+        let fd = pango::FontDescription::from_string(&self.font_description);
+        if snap.family.is_none() {
+            snap.family = fd.family().map(|gs| gs.to_string());
+        }
+        if snap.size_pt.is_none() {
+            let raw = fd.size() as f64 / pango::SCALE as f64;
+            snap.size_pt = Some(if raw > 0.0 { raw } else { 11.0 });
+        }
+        let has_bold_attr = self.attributes.iter().any(|a|
+            (a.start as usize) <= pos && (a.end as usize) > pos &&
+            matches!(a.value, AttrValue::Bold(_))
+        );
+        if !has_bold_attr {
+            snap.bold = fd.weight() == pango::Weight::Bold;
+        }
+        let has_italic_attr = self.attributes.iter().any(|a|
+            (a.start as usize) <= pos && (a.end as usize) > pos &&
+            matches!(a.value, AttrValue::Italic(_))
+        );
+        if !has_italic_attr {
+            snap.italic = fd.style() == pango::Style::Italic;
+        }
+        snap
+    }
+
+    /// Generates an HTML fragment representing the text with inline formatting tags.
+    pub fn to_html(&self) -> String {
+        if self.text.is_empty() { return String::new(); }
+        let mut boundaries: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        boundaries.insert(0);
+        boundaries.insert(self.text.len());
+        for attr in &self.attributes {
+            let s = (attr.start as usize).min(self.text.len());
+            let e = (attr.end as usize).min(self.text.len());
+            if self.text.is_char_boundary(s) { boundaries.insert(s); }
+            if self.text.is_char_boundary(e) { boundaries.insert(e); }
+        }
+        let boundaries: Vec<usize> = boundaries.into_iter().collect();
+        let mut html = String::new();
+        for w in boundaries.windows(2) {
+            let (seg_s, seg_e) = (w[0], w[1]);
+            if seg_s >= self.text.len() { break; }
+            let snap = self.get_attr_at(seg_s);
+            if snap.bold      { html.push_str("<b>"); }
+            if snap.italic    { html.push_str("<i>"); }
+            if snap.underline { html.push_str("<u>"); }
+            let has_span = snap.size_pt.is_some() || snap.color.is_some() || snap.family.is_some();
+            if has_span {
+                html.push_str("<span style=\"");
+                if let Some(f) = &snap.family { html.push_str(&format!("font-family:{};", f)); }
+                if let Some(pt) = snap.size_pt { html.push_str(&format!("font-size:{:.1}pt;", pt)); }
+                if let Some([r, g, b]) = snap.color { html.push_str(&format!("color:#{:02x}{:02x}{:02x};", r, g, b)); }
+                html.push_str("\">");
+            }
+            for ch in self.text[seg_s..seg_e].chars() {
+                match ch {
+                    '<'  => html.push_str("&lt;"),
+                    '>'  => html.push_str("&gt;"),
+                    '&'  => html.push_str("&amp;"),
+                    '\n' => html.push_str("<br>"),
+                    c    => html.push(c),
+                }
+            }
+            if has_span       { html.push_str("</span>"); }
+            if snap.underline { html.push_str("</u>"); }
+            if snap.italic    { html.push_str("</i>"); }
+            if snap.bold      { html.push_str("</b>"); }
+        }
+        html
+    }
 }
 
 // ── Cursor & selection ────────────────────────────────────────────────────────
@@ -376,6 +497,7 @@ impl TextBox {
         use pango::prelude::FontMapExt;
         let font_map = pangocairo::FontMap::default();
         let ctx = font_map.create_context();
+        pangocairo::functions::context_set_resolution(&ctx, 25.4 * scale);
         let padding = self.padding * scale;
         let layout = self.prepare_layout(&ctx, frame_w_px, padding);
         let pscale = pango::SCALE as f64;
@@ -411,6 +533,9 @@ impl TextBox {
                 gdk::Key::c | gdk::Key::C => { self.copy_selection(); KeyAction::Handled }
                 gdk::Key::x | gdk::Key::X => { self.cut_selection(); KeyAction::Handled }
                 gdk::Key::v | gdk::Key::V => KeyAction::RequestPaste,
+                gdk::Key::b | gdk::Key::B => KeyAction::FormatBold,
+                gdk::Key::i | gdk::Key::I => KeyAction::FormatItalic,
+                gdk::Key::u | gdk::Key::U => KeyAction::FormatUnderline,
                 _ => KeyAction::Handled,
             };
         }
@@ -456,6 +581,9 @@ impl TextBox {
             TextAlign::Center => pango::Alignment::Center,
             TextAlign::Right  => pango::Alignment::Right,
         });
+        if self.line_spacing != 1.0 {
+            layout.set_line_spacing(self.line_spacing as f32);
+        }
         layout
     }
 
@@ -495,6 +623,51 @@ impl TextBox {
         let layout = self.prepare_layout(pango_ctx, w, padding);
         let (_, ph) = layout.size();
         ph as f64 / pango::SCALE as f64 + 2.0 * padding
+    }
+
+    /// Returns how many bytes of `self.text` fit within the frame dimensions.
+    /// Used during chain reflow to split text across linked frames.
+    pub fn text_capacity(&self, w_px: f64, h_px: f64, scale: f64) -> usize {
+        use pango::prelude::FontMapExt;
+        if self.text.is_empty() {
+            return 0;
+        }
+        let font_map = pangocairo::FontMap::default();
+        let ctx = font_map.create_context();
+        pangocairo::functions::context_set_resolution(&ctx, 25.4 * scale);
+        let padding = self.padding * scale;
+        let layout = self.prepare_layout(&ctx, w_px, padding);
+        let pscale = pango::SCALE as f64;
+        let available_h_pango = ((h_px - 2.0 * padding) * pscale).max(0.0) as i32;
+
+        // Fast path: all text fits
+        let (_, total_h) = layout.size();
+        if total_h <= available_h_pango {
+            return self.text.len();
+        }
+
+        let n_lines = layout.line_count();
+        let mut last_fit_end = 0usize;
+
+        for i in 0..n_lines {
+            if let Some(line) = layout.line(i) {
+                let start_byte = line.start_index() as i32;
+                let (strong, _) = layout.cursor_pos(start_byte);
+                let line_bottom = strong.y() + strong.height();
+                if line_bottom > available_h_pango {
+                    break;
+                }
+                last_fit_end = (line.start_index() as usize + line.length() as usize)
+                    .min(self.text.len());
+            }
+        }
+
+        // Ensure valid char boundary
+        while last_fit_end > 0 && !self.text.is_char_boundary(last_fit_end) {
+            last_fit_end -= 1;
+        }
+
+        last_fit_end
     }
 
     /// Renders the text box into `cr` (translated to item origin).
@@ -594,6 +767,7 @@ impl TextBox {
         use pango::prelude::FontMapExt;
         let font_map = pangocairo::FontMap::default();
         let ctx = font_map.create_context();
+        pangocairo::functions::context_set_resolution(&ctx, 25.4 * scale);
         let pscale = pango::SCALE as f64;
         let padding = self.padding * scale;
         let layout = self.prepare_layout(&ctx, frame_w_px, padding);

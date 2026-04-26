@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use crate::document::{Document, Item, ItemContent, ItemType};
-use crate::text_box::{TextBox, KeyAction};
+use crate::text_box::{TextBox, KeyAction, AttrValue, AttrSnapshot, TextAlign, TextAttribute};
 use crate::image_box::{FitMode, ImageBox};
 use crate::svg_box::SvgBox;
 use crate::persistence::PersistenceManager;
@@ -40,6 +40,17 @@ pub struct AppModel {
     page_layout: PageLayout,
     last_save_path: Option<String>,
     editing_flag: Rc<RefCell<bool>>,
+    cursor_snapshot: AttrSnapshot,
+    cursor_alignment: TextAlign,
+    /// Monotone counter bumped on every text edit; used to discard stale reflow timeouts.
+    reflow_version: u64,
+    /// Active canvas drag-to-link operation.
+    link_drag_active: bool,
+    link_drag_source_id: Option<String>,
+    /// Arrow start in screen px (bottom-right corner of source frame).
+    link_drag_start: Option<(f64, f64)>,
+    /// Current mouse position in screen px during link drag.
+    link_drag_current: Option<(f64, f64)>,
 }
 
 impl AppModel {
@@ -63,6 +74,17 @@ impl AppModel {
             }
         }
         None
+    }
+
+    fn selected_has_link(&self) -> bool {
+        self.selected_item_id.as_ref()
+            .and_then(|id| self.find_item(id))
+            .map(|(_, item)| {
+                if let ItemContent::Text(tb) = &item.content {
+                    tb.next_frame_id.is_some() || tb.prev_frame_id.is_some()
+                } else { false }
+            })
+            .unwrap_or(false)
     }
 
     fn selected_item_type(&self) -> Option<ItemType> {
@@ -159,6 +181,17 @@ pub enum AppInput {
     ExportPdf,
     ProjectSaved(String),
     ProjectLoaded(Document, String),
+    SetBold(bool),
+    SetItalic(bool),
+    SetUnderline(bool),
+    SetFontFamily(String),
+    SetFontSize(f64),
+    SetTextAlign(TextAlign),
+    ClearFormat,
+    LinkTo(String),
+    UnlinkFrame,
+    /// Fired by the debounce timer; ignored if `version` no longer matches.
+    MaybeReflow(u64),
 }
 
 #[derive(Debug)]
@@ -328,6 +361,161 @@ impl Component for AppModel {
                             set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
                             connect_clicked => AppInput::StartEdit,
                         },
+
+                        // ── Text formatting panel ─────────────────────────
+                        gtk::Separator {
+                            #[watch]
+                            set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
+                        },
+                        gtk::Label {
+                            set_label: "Carácter",
+                            add_css_class: "heading",
+                            set_xalign: 0.0,
+                            #[watch]
+                            set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
+                        },
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 4,
+                            #[watch]
+                            set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
+                            #[watch]
+                            set_sensitive: model.is_editing,
+                            gtk::Box {
+                                add_css_class: "linked",
+                                set_orientation: gtk::Orientation::Horizontal,
+                                gtk::ToggleButton {
+                                    set_label: "B",
+                                    set_tooltip_text: Some("Negrita (Ctrl+B)"),
+                                    #[watch]
+                                    set_active: model.cursor_snapshot.bold,
+                                    connect_toggled[sender] => move |btn| {
+                                        sender.input(AppInput::SetBold(btn.is_active()));
+                                    },
+                                },
+                                gtk::ToggleButton {
+                                    set_label: "I",
+                                    set_tooltip_text: Some("Cursiva (Ctrl+I)"),
+                                    #[watch]
+                                    set_active: model.cursor_snapshot.italic,
+                                    connect_toggled[sender] => move |btn| {
+                                        sender.input(AppInput::SetItalic(btn.is_active()));
+                                    },
+                                },
+                                gtk::ToggleButton {
+                                    set_label: "U",
+                                    set_tooltip_text: Some("Subrayado (Ctrl+U)"),
+                                    #[watch]
+                                    set_active: model.cursor_snapshot.underline,
+                                    connect_toggled[sender] => move |btn| {
+                                        sender.input(AppInput::SetUnderline(btn.is_active()));
+                                    },
+                                },
+                            },
+                            gtk::Button {
+                                set_icon_name: "edit-clear-symbolic",
+                                set_tooltip_text: Some("Limpiar formato"),
+                                add_css_class: "flat",
+                                connect_clicked[sender] => move |_| {
+                                    sender.input(AppInput::ClearFormat);
+                                },
+                            },
+                        },
+                        gtk::Entry {
+                            set_placeholder_text: Some("Fuente"),
+                            set_tooltip_text: Some("Familia de fuente (Enter para aplicar)"),
+                            #[watch]
+                            set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
+                            #[watch]
+                            set_sensitive: model.is_editing,
+                            #[watch]
+                            set_text: model.cursor_snapshot.family.as_deref().unwrap_or(""),
+                            connect_activate[sender] => move |entry| {
+                                let f = entry.text().to_string();
+                                if !f.is_empty() {
+                                    sender.input(AppInput::SetFontFamily(f));
+                                }
+                            },
+                        },
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 6,
+                            #[watch]
+                            set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
+                            #[watch]
+                            set_sensitive: model.is_editing,
+                            gtk::Label {
+                                set_label: "Tamaño:",
+                            },
+                            gtk::SpinButton {
+                                set_climb_rate: 1.0,
+                                set_digits: 1,
+                                set_range: (1.0, 200.0),
+                                set_increments: (1.0, 10.0),
+                                set_hexpand: true,
+                                set_tooltip_text: Some("Tamaño de fuente (pt)"),
+                                #[watch]
+                                set_value: model.cursor_snapshot.size_pt.unwrap_or(11.0),
+                                connect_value_changed[sender] => move |spin| {
+                                    sender.input(AppInput::SetFontSize(spin.value()));
+                                },
+                            },
+                        },
+                        gtk::Label {
+                            set_label: "Alineación",
+                            add_css_class: "heading",
+                            set_xalign: 0.0,
+                            #[watch]
+                            set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
+                        },
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            add_css_class: "linked",
+                            #[watch]
+                            set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
+                            #[watch]
+                            set_sensitive: model.is_editing,
+                            gtk::ToggleButton {
+                                set_icon_name: "format-justify-left-symbolic",
+                                set_tooltip_text: Some("Alinear izquierda"),
+                                #[watch]
+                                set_active: matches!(model.cursor_alignment, TextAlign::Left),
+                                connect_clicked[sender] => move |_| {
+                                    sender.input(AppInput::SetTextAlign(TextAlign::Left));
+                                },
+                            },
+                            gtk::ToggleButton {
+                                set_icon_name: "format-justify-center-symbolic",
+                                set_tooltip_text: Some("Centrar"),
+                                #[watch]
+                                set_active: matches!(model.cursor_alignment, TextAlign::Center),
+                                connect_clicked[sender] => move |_| {
+                                    sender.input(AppInput::SetTextAlign(TextAlign::Center));
+                                },
+                            },
+                            gtk::ToggleButton {
+                                set_icon_name: "format-justify-right-symbolic",
+                                set_tooltip_text: Some("Alinear derecha"),
+                                #[watch]
+                                set_active: matches!(model.cursor_alignment, TextAlign::Right),
+                                connect_clicked[sender] => move |_| {
+                                    sender.input(AppInput::SetTextAlign(TextAlign::Right));
+                                },
+                            },
+                        },
+
+                        // ── Text chain panel ──────────────────────────────
+                        gtk::Separator {
+                            #[watch]
+                            set_visible: model.selected_item_type() == Some(ItemType::TextFrame) && model.selected_has_link(),
+                        },
+                        gtk::Button {
+                            set_label: "Desencadenar",
+                            #[watch]
+                            set_visible: model.selected_item_type() == Some(ItemType::TextFrame) && model.selected_has_link(),
+                            connect_clicked => AppInput::UnlinkFrame,
+                        },
+
                         gtk::Button {
                             set_label: "Import Image",
                             #[watch]
@@ -392,8 +580,11 @@ impl Component for AppModel {
                                         let layout = model.page_layout;
                                         let images = model.image_surfaces.clone();
                                         let svgs = model.svg_handles.clone();
+                                        let link_drag = if model.link_drag_active {
+                                            model.link_drag_start.zip(model.link_drag_current)
+                                        } else { None };
                                         move |_area, cr, _w, _h| {
-                                            draw_canvas(cr, &doc, d_start, d_current, selected.clone(), editing, &images, &svgs, zoom, layout);
+                                            draw_canvas(cr, &doc, d_start, d_current, selected.clone(), editing, &images, &svgs, zoom, layout, link_drag);
                                         }
                                     },
 
@@ -711,6 +902,13 @@ impl Component for AppModel {
             page_layout: PageLayout::Vertical,
             last_save_path: None,
             editing_flag: Rc::new(RefCell::new(false)),
+            cursor_snapshot: AttrSnapshot::default(),
+            cursor_alignment: TextAlign::default(),
+            reflow_version: 0,
+            link_drag_active: false,
+            link_drag_source_id: None,
+            link_drag_start: None,
+            link_drag_current: None,
         };
 
         let widgets = view_output!();
@@ -726,6 +924,21 @@ impl Component for AppModel {
     ) {
         self.update(message, sender.clone(), root);
         self.update_view(widgets, sender);
+
+        if self.selected_item_type() == Some(ItemType::TextFrame) {
+            if let Some(id) = self.selected_item_id.clone() {
+                if let Some((_, item)) = self.find_item(&id) {
+                    if let ItemContent::Text(ref tb) = item.content {
+                        let pos = if self.is_editing { tb.cursor_pos } else { 0 };
+                        self.cursor_snapshot = tb.effective_snapshot_at(pos);
+                        self.cursor_alignment = tb.get_alignment();
+                    }
+                }
+            }
+        } else {
+            self.cursor_snapshot = AttrSnapshot::default();
+            self.cursor_alignment = TextAlign::default();
+        }
 
         if self.request_focus {
             self.request_focus = false;
@@ -1083,6 +1296,20 @@ impl Component for AppModel {
                 if let Some(tb) = self.get_editing_text_box_mut() {
                     tb.insert_text(&text);
                 }
+                if let Some(id) = self.selected_item_id.clone() {
+                    if is_in_chain(&self.document, &id) {
+                        self.reflow_version = self.reflow_version.wrapping_add(1);
+                        let version = self.reflow_version;
+                        let s = sender.clone();
+                        gtk::glib::timeout_add_local(
+                            std::time::Duration::from_millis(250),
+                            move || {
+                                s.input(AppInput::MaybeReflow(version));
+                                gtk::glib::ControlFlow::Break
+                            },
+                        );
+                    }
+                }
                 let item_dims = self.selected_item_id.as_ref()
                     .and_then(|id| self.find_item(id))
                     .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
@@ -1136,9 +1363,32 @@ impl Component for AppModel {
                             tb.move_cursor_vertical(up, extend, frame_w_px, SCALE);
                         }
                     }
+                    KeyAction::FormatBold => {
+                        sender.input(AppInput::SetBold(!self.cursor_snapshot.bold));
+                    }
+                    KeyAction::FormatItalic => {
+                        sender.input(AppInput::SetItalic(!self.cursor_snapshot.italic));
+                    }
+                    KeyAction::FormatUnderline => {
+                        sender.input(AppInput::SetUnderline(!self.cursor_snapshot.underline));
+                    }
                     KeyAction::Handled => {}
                 }
 
+                if let Some(id) = self.selected_item_id.clone() {
+                    if is_in_chain(&self.document, &id) {
+                        self.reflow_version = self.reflow_version.wrapping_add(1);
+                        let version = self.reflow_version;
+                        let s = sender.clone();
+                        gtk::glib::timeout_add_local(
+                            std::time::Duration::from_millis(250),
+                            move || {
+                                s.input(AppInput::MaybeReflow(version));
+                                gtk::glib::ControlFlow::Break
+                            },
+                        );
+                    }
+                }
                 let item_dims = self.selected_item_id.as_ref()
                     .and_then(|id| self.find_item(id))
                     .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
@@ -1170,6 +1420,36 @@ impl Component for AppModel {
             AppInput::DragStart(x, y) => {
                 let x_mm = x / self.scale();
                 let y_mm = y / self.scale();
+
+                // Check if the user clicked the link-out button on any text frame
+                if !self.is_editing {
+                    'link_check: for (page_idx, page) in self.document.pages.iter().enumerate() {
+                        let (off_x, off_y) = self.get_page_offset(page_idx);
+                        let local_x = x_mm - off_x;
+                        let local_y = y_mm - off_y;
+                        for item in &page.items {
+                            if let ItemContent::Text(tb) = &item.content {
+                                if tb.next_frame_id.is_some() { continue; }
+                                let pango_ctx = make_pango_ctx();
+                                let w_px = item.width * SCALE;
+                                let h_px = item.height * SCALE;
+                                if tb.required_height(&pango_ctx, w_px, SCALE) > h_px
+                                    && hit_link_button_mm(item, local_x, local_y)
+                                {
+                                    self.link_drag_active = true;
+                                    self.link_drag_source_id = Some(item.id.clone());
+                                    self.selected_item_id = Some(item.id.clone());
+                                    let sc = self.scale();
+                                    let sx = (off_x + item.x + item.width) * sc;
+                                    let sy = (off_y + item.y + item.height) * sc;
+                                    self.link_drag_start = Some((sx, sy));
+                                    self.link_drag_current = Some((x, y));
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if self.is_editing {
                     if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
@@ -1255,6 +1535,12 @@ impl Component for AppModel {
                 }
             }
             AppInput::DragUpdate(offset_x, offset_y) => {
+                if self.link_drag_active {
+                    if let Some((sx, sy)) = self.link_drag_start {
+                        self.link_drag_current = Some((sx + offset_x, sy + offset_y));
+                    }
+                    return;
+                }
                 if self.text_drag_active {
                     if let Some((sx, sy)) = self.drag_start {
                         let x_mm = (sx + offset_x) / self.scale();
@@ -1490,6 +1776,24 @@ impl Component for AppModel {
                 }
             }
             AppInput::DragEnd => {
+                if self.link_drag_active {
+                    // Try to link to whichever text frame is under the cursor
+                    if let Some((cx, cy)) = self.link_drag_current {
+                        if let Some((_, target)) = self.hit_test_all_pages(cx, cy) {
+                            if target.content.item_type() == ItemType::TextFrame
+                                && self.link_drag_source_id.as_deref() != Some(&target.id)
+                            {
+                                let tid = target.id.clone();
+                                sender.input(AppInput::LinkTo(tid));
+                            }
+                        }
+                    }
+                    self.link_drag_active = false;
+                    self.link_drag_source_id = None;
+                    self.link_drag_start = None;
+                    self.link_drag_current = None;
+                    return;
+                }
                 if self.text_drag_active {
                     self.text_drag_active = false;
                     self.drag_start = None;
@@ -1638,7 +1942,7 @@ impl Component for AppModel {
                 self.last_save_path = Some(path);
                 self.selected_item_id = None;
                 self.is_editing = false;
-                
+
                 // Pre-load all images from the loaded document
                 for page in &self.document.pages {
                     for item in &page.items {
@@ -1661,6 +1965,340 @@ impl Component for AppModel {
                     }
                 }
             }
+            AppInput::SetBold(value) => {
+                if !self.is_editing { return; }
+                if let Some(tb) = self.get_editing_text_box_mut() {
+                    if tb.get_attr_at(tb.cursor_pos).bold != value {
+                        let (s, e) = tb.selection_or_word_range();
+                        if s < e { tb.apply_format(s, e, AttrValue::Bold(value)); }
+                    }
+                }
+            }
+            AppInput::SetItalic(value) => {
+                if !self.is_editing { return; }
+                if let Some(tb) = self.get_editing_text_box_mut() {
+                    if tb.get_attr_at(tb.cursor_pos).italic != value {
+                        let (s, e) = tb.selection_or_word_range();
+                        if s < e { tb.apply_format(s, e, AttrValue::Italic(value)); }
+                    }
+                }
+            }
+            AppInput::SetUnderline(value) => {
+                if !self.is_editing { return; }
+                if let Some(tb) = self.get_editing_text_box_mut() {
+                    if tb.get_attr_at(tb.cursor_pos).underline != value {
+                        let (s, e) = tb.selection_or_word_range();
+                        if s < e { tb.apply_format(s, e, AttrValue::Underline(value)); }
+                    }
+                }
+            }
+            AppInput::SetFontFamily(family) => {
+                if !self.is_editing { return; }
+                if let Some(tb) = self.get_editing_text_box_mut() {
+                    let (s, e) = tb.selection_or_word_range();
+                    if s < e { tb.apply_format(s, e, AttrValue::Family(family)); }
+                }
+            }
+            AppInput::SetFontSize(size) => {
+                if !self.is_editing { return; }
+                if let Some(tb) = self.get_editing_text_box_mut() {
+                    let current = tb.effective_snapshot_at(tb.cursor_pos).size_pt.unwrap_or(11.0);
+                    if (size - current).abs() > 0.05 {
+                        let (s, e) = tb.selection_or_word_range();
+                        if s < e { tb.apply_format(s, e, AttrValue::Size(size)); }
+                    }
+                }
+            }
+            AppInput::SetTextAlign(align) => {
+                if !self.is_editing { return; }
+                if let Some(tb) = self.get_editing_text_box_mut() {
+                    tb.set_alignment(align);
+                }
+            }
+            AppInput::ClearFormat => {
+                if !self.is_editing { return; }
+                if let Some(tb) = self.get_editing_text_box_mut() {
+                    let (s, e) = tb.selection_or_word_range();
+                    if s < e { tb.clear_format(s, e); }
+                }
+            }
+            AppInput::MaybeReflow(version) => {
+                if version == self.reflow_version {
+                    if let Some(id) = self.selected_item_id.clone() {
+                        if is_in_chain(&self.document, &id) {
+                            let sc = self.scale();
+                            reflow_chain(&mut self.document, &id, sc);
+                        }
+                    }
+                }
+            }
+            AppInput::LinkTo(target_id) => {
+                let source_id = self.link_drag_source_id.clone()
+                    .or_else(|| self.selected_item_id.clone());
+
+                if let Some(source_id) = source_id {
+                    let target_already_chained = self.find_item(&target_id)
+                        .map(|(_, item)| {
+                            if let ItemContent::Text(tb) = &item.content {
+                                tb.prev_frame_id.is_some()
+                            } else { true }
+                        })
+                        .unwrap_or(true);
+
+                    if !target_already_chained {
+                        if let Some((_, item)) = self.find_item_mut(&source_id) {
+                            if let ItemContent::Text(tb) = &mut item.content {
+                                tb.next_frame_id = Some(target_id.clone());
+                            }
+                        }
+                        if let Some((_, item)) = self.find_item_mut(&target_id) {
+                            if let ItemContent::Text(tb) = &mut item.content {
+                                tb.prev_frame_id = Some(source_id.clone());
+                            }
+                        }
+                        let sc = self.scale();
+                        reflow_chain(&mut self.document, &source_id, sc);
+                    }
+                }
+            }
+            AppInput::UnlinkFrame => {
+                if let Some(id) = self.selected_item_id.clone() {
+                    let (next_id, prev_id) = self.find_item(&id)
+                        .and_then(|(_, item)| {
+                            if let ItemContent::Text(tb) = &item.content {
+                                Some((tb.next_frame_id.clone(), tb.prev_frame_id.clone()))
+                            } else { None }
+                        })
+                        .unwrap_or((None, None));
+
+                    // Disconnect selected frame from both neighbours
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Text(tb) = &mut item.content {
+                            tb.next_frame_id = None;
+                            tb.prev_frame_id = None;
+                        }
+                    }
+                    if let Some(nid) = next_id {
+                        if let Some((_, item)) = self.find_item_mut(&nid) {
+                            if let ItemContent::Text(tb) = &mut item.content {
+                                tb.prev_frame_id = None;
+                            }
+                        }
+                    }
+                    if let Some(pid) = prev_id {
+                        if let Some((_, item)) = self.find_item_mut(&pid) {
+                            if let ItemContent::Text(tb) = &mut item.content {
+                                tb.next_frame_id = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Link-button geometry ──────────────────────────────────────────────────────
+
+// The overflow indicator occupies the bottom-right corner of the item:
+//   size = 10 px, margin = 3 px  (all in SCALE-space pixels)
+// The link button sits immediately to its left, separated by a 2 px gap.
+const LINK_BTN_SIZE_PX: f64 = 10.0;
+const OVERFLOW_SIZE_PX: f64 = 10.0;
+const CORNER_MARGIN_PX: f64 = 3.0;
+const LINK_GAP_PX: f64 = 2.0;
+
+/// Returns the link-button rect in local page mm coordinates.
+/// `item.{x,y,width,height}` are already in mm.
+fn link_button_rect_mm(item: &Item) -> (f64, f64, f64, f64) {
+    let size   = LINK_BTN_SIZE_PX  / SCALE;
+    let margin = CORNER_MARGIN_PX  / SCALE;
+    let gap    = LINK_GAP_PX       / SCALE;
+    let ovf    = OVERFLOW_SIZE_PX  / SCALE;
+    let x = item.x + item.width  - margin - ovf - gap - size;
+    let y = item.y + item.height - margin - size;
+    (x, y, size, size)
+}
+
+fn hit_link_button_mm(item: &Item, local_x_mm: f64, local_y_mm: f64) -> bool {
+    let (x, y, w, h) = link_button_rect_mm(item);
+    local_x_mm >= x && local_x_mm <= x + w && local_y_mm >= y && local_y_mm <= y + h
+}
+
+// ── Text-chain reflow ─────────────────────────────────────────────────────────
+
+fn is_in_chain(doc: &Document, id: &str) -> bool {
+    doc.pages.iter()
+        .flat_map(|p| p.items.iter())
+        .find(|i| i.id == id)
+        .map(|item| {
+            if let ItemContent::Text(tb) = &item.content {
+                tb.next_frame_id.is_some() || tb.prev_frame_id.is_some()
+            } else { false }
+        })
+        .unwrap_or(false)
+}
+
+fn find_chain_root(doc: &Document, start_id: &str) -> String {
+    let mut current = start_id.to_string();
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        if !visited.insert(current.clone()) { break; } // cycle guard
+        let prev = doc.pages.iter()
+            .flat_map(|p| p.items.iter())
+            .find(|i| i.id == current)
+            .and_then(|i| {
+                if let ItemContent::Text(tb) = &i.content { tb.prev_frame_id.clone() } else { None }
+            });
+        match prev {
+            Some(p) => current = p,
+            None => break,
+        }
+    }
+    current
+}
+
+fn collect_chain(doc: &Document, root_id: &str) -> Vec<String> {
+    let mut chain = vec![root_id.to_string()];
+    let mut current = root_id.to_string();
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(root_id.to_string());
+    loop {
+        let next = doc.pages.iter()
+            .flat_map(|p| p.items.iter())
+            .find(|i| i.id == current)
+            .and_then(|i| {
+                if let ItemContent::Text(tb) = &i.content { tb.next_frame_id.clone() } else { None }
+            });
+        match next {
+            Some(n) if !visited.contains(&n) => {
+                visited.insert(n.clone());
+                chain.push(n.clone());
+                current = n;
+            }
+            _ => break,
+        }
+    }
+    chain
+}
+
+/// Returns attributes from `global_attrs` that overlap `[start, end)`,
+/// clamped and shifted so positions are relative to `start`.
+fn slice_attrs_for_range(
+    global_attrs: &[TextAttribute],
+    start: usize,
+    end: usize,
+) -> Vec<TextAttribute> {
+    let s = start as u32;
+    let e = end as u32;
+    let mut out = Vec::new();
+    for attr in global_attrs {
+        if attr.end <= s || attr.start >= e { continue; }
+        let clamped_start = attr.start.max(s) - s;
+        let clamped_end   = attr.end.min(e)   - s;
+        if clamped_end > clamped_start {
+            out.push(TextAttribute { start: clamped_start, end: clamped_end, value: attr.value.clone() });
+        }
+    }
+    out
+}
+
+/// Redistributes the chain's text across all linked frames.
+fn reflow_chain(doc: &mut Document, any_id: &str, scale: f64) {
+    let root_id = find_chain_root(doc, any_id);
+    let chain = collect_chain(doc, &root_id);
+    if chain.len() < 2 { return; }
+
+    // Snapshot each frame's current data (text + attrs + dimensions)
+    struct FrameSnap {
+        id: String,
+        w: f64,
+        h: f64,
+        tb: TextBox,
+    }
+    let snaps: Vec<FrameSnap> = chain.iter().map(|id| {
+        doc.pages.iter()
+            .flat_map(|p| p.items.iter())
+            .find(|i| &i.id == id)
+            .map(|item| {
+                let tb = if let ItemContent::Text(tb) = &item.content { tb.clone() } else { TextBox::default() };
+                FrameSnap { id: id.clone(), w: item.width, h: item.height, tb }
+            })
+            .unwrap_or_else(|| FrameSnap { id: id.clone(), w: 100.0, h: 100.0, tb: TextBox::default() })
+    }).collect();
+
+    // Build global text and attributes from per-frame local slices
+    let mut global_text = String::new();
+    let mut global_attrs: Vec<TextAttribute> = Vec::new();
+    for snap in &snaps {
+        let offset = global_text.len() as u32;
+        global_text.push_str(&snap.tb.text);
+        for attr in &snap.tb.attributes {
+            global_attrs.push(TextAttribute {
+                start: attr.start + offset,
+                end:   attr.end   + offset,
+                value: attr.value.clone(),
+            });
+        }
+    }
+
+    // Distribute text into each frame
+    let mut offset = 0usize;
+    let n = snaps.len();
+
+    for (i, snap) in snaps.iter().enumerate() {
+        let is_last = i == n - 1;
+        let remaining = &global_text[offset..];
+
+        let capacity = if is_last || remaining.is_empty() {
+            remaining.len()
+        } else {
+            // Build a temp TextBox with the remaining text to measure capacity
+            let mut temp = snap.tb.clone();
+            temp.text = remaining.to_string();
+            temp.attributes = slice_attrs_for_range(&global_attrs, offset, global_text.len())
+                .into_iter()
+                .map(|a| TextAttribute { start: a.start, end: a.end, value: a.value })
+                .collect();
+            temp.text_capacity(snap.w * scale, snap.h * scale, scale)
+        };
+
+        let frame_text  = global_text[offset..offset + capacity].to_string();
+        let frame_attrs = slice_attrs_for_range(&global_attrs, offset, offset + capacity);
+
+        if let Some(item) = doc.pages.iter_mut()
+            .flat_map(|p| p.items.iter_mut())
+            .find(|i| i.id == snap.id)
+        {
+            if let ItemContent::Text(tb) = &mut item.content {
+                tb.text_offset = offset;
+                tb.text        = frame_text;
+                tb.attributes  = frame_attrs;
+                if tb.cursor_pos > tb.text.len() { tb.cursor_pos = tb.text.len(); }
+                if tb.selection_anchor.map_or(false, |a| a > tb.text.len()) {
+                    tb.selection_anchor = None;
+                }
+            }
+        }
+
+        offset += capacity;
+        if offset >= global_text.len() {
+            // Clear any remaining frames
+            for later in &chain[i + 1..] {
+                if let Some(item) = doc.pages.iter_mut()
+                    .flat_map(|p| p.items.iter_mut())
+                    .find(|i| &i.id == later)
+                {
+                    if let ItemContent::Text(tb) = &mut item.content {
+                        tb.text_offset = offset;
+                        tb.text.clear();
+                        tb.attributes.clear();
+                        tb.cursor_pos = 0;
+                        tb.selection_anchor = None;
+                    }
+                }
+            }
+            break;
         }
     }
 }
@@ -1804,6 +2442,7 @@ fn draw_page_content(
     is_editing: bool,
     draw_handles: bool,
     scale_factor: f64,
+    chain_ids: &[String],
 ) {
     for item in &page.items {
         let is_selected = selected_id == Some(&item.id);
@@ -1852,6 +2491,89 @@ fn draw_page_content(
                 cr.stroke().unwrap();
             }
         }
+
+        // Chain sibling highlight: dashed border on every non-selected member of the chain
+        if !chain_ids.is_empty() && selected_id != Some(&item.id)
+            && chain_ids.iter().any(|cid| *cid == item.id)
+        {
+            let w = item.width  * scale_factor;
+            let h = item.height * scale_factor;
+            cr.save().unwrap();
+            cr.translate(item.x * scale_factor, item.y * scale_factor);
+            cr.set_source_rgba(0.25, 0.55, 1.0, 0.75);
+            cr.set_line_width(1.5);
+            cr.set_dash(&[5.0, 3.0], 0.0);
+            cr.rectangle(1.0, 1.0, w - 2.0, h - 2.0);
+            cr.stroke().unwrap();
+            cr.set_dash(&[], 0.0);
+            cr.restore().unwrap();
+        }
+
+        // Chain indicators and link-out button
+        if let ItemContent::Text(tb) = &item.content {
+            let sf = scale_factor;
+            // "flows in" indicator: green right-triangle at top-left
+            if tb.prev_frame_id.is_some() {
+                let x = item.x * sf;
+                let y = item.y * sf;
+                let s = 10.0f64;
+                cr.set_source_rgb(0.0, 0.72, 0.42);
+                cr.move_to(x, y);
+                cr.line_to(x + s, y);
+                cr.line_to(x, y + s);
+                cr.close_path();
+                cr.fill().unwrap();
+            }
+            // "flows out" indicator or link button at bottom-right
+            let w = item.width  * sf;
+            let h = item.height * sf;
+            let item_has_overflow = !tb.text.is_empty()
+                && h >= 20.0
+                && tb.required_height(pango_ctx, w, sf) > h;
+
+            if tb.next_frame_id.is_some() {
+                // Already linked → orange arrow indicator next to overflow spot
+                let margin = CORNER_MARGIN_PX;
+                let size   = OVERFLOW_SIZE_PX;
+                let gap    = LINK_GAP_PX;
+                let bx = item.x * sf + w - margin - size - gap - size;
+                let by = item.y * sf + h - margin - size;
+                cr.set_source_rgb(1.0, 0.55, 0.0);
+                cr.rectangle(bx, by, size, size);
+                cr.fill().unwrap();
+                cr.set_source_rgb(1.0, 1.0, 1.0);
+                cr.set_line_width(1.2);
+                let my = by + size / 2.0;
+                cr.move_to(bx + 2.0, my);
+                cr.line_to(bx + size - 2.5, my);
+                cr.move_to(bx + size - 4.5, my - 2.0);
+                cr.line_to(bx + size - 2.5, my);
+                cr.line_to(bx + size - 4.5, my + 2.0);
+                cr.stroke().unwrap();
+            } else if item_has_overflow {
+                // Overflow, no successor → blue link button
+                let margin = CORNER_MARGIN_PX;
+                let size   = LINK_BTN_SIZE_PX;
+                let gap    = LINK_GAP_PX;
+                let ovf    = OVERFLOW_SIZE_PX;
+                let bx = item.x * sf + w - margin - ovf - gap - size;
+                let by = item.y * sf + h - margin - size;
+                cr.set_source_rgb(0.15, 0.45, 0.95);
+                cr.rectangle(bx, by, size, size);
+                cr.fill().unwrap();
+                // Chain icon: two small squares joined by a bar
+                cr.set_source_rgb(1.0, 1.0, 1.0);
+                cr.set_line_width(1.2);
+                let cy = by + size / 2.0;
+                cr.rectangle(bx + 1.5, cy - 1.5, 3.0, 3.0);
+                cr.stroke().unwrap();
+                cr.rectangle(bx + size - 4.5, cy - 1.5, 3.0, 3.0);
+                cr.stroke().unwrap();
+                cr.move_to(bx + 4.5, cy);
+                cr.line_to(bx + size - 4.5, cy);
+                cr.stroke().unwrap();
+            }
+        }
     }
 }
 
@@ -1866,6 +2588,7 @@ fn draw_canvas(
     svg_handles: &HashMap<String, Rc<rsvg::SvgHandle>>,
     zoom: f64,
     layout: PageLayout,
+    link_drag: Option<((f64, f64), (f64, f64))>,
 ) {
     cr.save().unwrap();
     cr.scale(zoom, zoom);
@@ -1874,6 +2597,15 @@ fn draw_canvas(
     // 25.4 mm/inch * 3.0 px/mm = 76.2 DPI
     let pango_ctx = pangocairo::functions::create_context(cr);
     pangocairo::functions::context_set_resolution(&pango_ctx, 25.4 * SCALE);
+
+    // Collect chain siblings of the selected frame so they can be highlighted
+    let chain_ids: Vec<String> = selected_id.as_ref()
+        .filter(|id| is_in_chain(doc, id))
+        .map(|id| {
+            let root = find_chain_root(doc, id);
+            collect_chain(doc, &root)
+        })
+        .unwrap_or_default();
 
     let page_gap = 20.0;
     for (page_idx, page) in doc.pages.iter().enumerate() {
@@ -1906,7 +2638,7 @@ fn draw_canvas(
         cr.stroke().unwrap();
         cr.set_dash(&[], 0.0);
 
-        draw_page_content(cr, &pango_ctx, page, images, svg_handles, selected_id.as_ref(), is_editing, true, SCALE);
+        draw_page_content(cr, &pango_ctx, page, images, svg_handles, selected_id.as_ref(), is_editing, true, SCALE, &chain_ids);
 
         cr.restore().unwrap();
     }
@@ -1921,6 +2653,32 @@ fn draw_canvas(
             cr.set_line_width(1.0);
             cr.rectangle(sx.min(cx), sy.min(cy), (sx - cx).abs(), (sy - cy).abs());
             cr.stroke().unwrap();
+        }
+    }
+
+    // Link-drag arrow (drawn in screen pixels, outside the zoom transform)
+    if let Some(((sx, sy), (cx, cy))) = link_drag {
+        let dx = cx - sx;
+        let dy = cy - sy;
+        let len = (dx * dx + dy * dy).sqrt();
+        cr.set_source_rgba(0.15, 0.45, 0.95, 0.9);
+        cr.set_line_width(2.0);
+        cr.set_dash(&[6.0, 4.0], 0.0);
+        cr.move_to(sx, sy);
+        cr.line_to(cx, cy);
+        cr.stroke().unwrap();
+        cr.set_dash(&[], 0.0);
+        // Arrowhead
+        if len > 8.0 {
+            let nx = dx / len;
+            let ny = dy / len;
+            let al = 12.0;
+            let aw = 6.0;
+            cr.move_to(cx, cy);
+            cr.line_to(cx - nx * al - ny * aw, cy - ny * al + nx * aw);
+            cr.line_to(cx - nx * al + ny * aw, cy - ny * al - nx * aw);
+            cr.close_path();
+            cr.fill().unwrap();
         }
     }
 }
@@ -1953,7 +2711,7 @@ pub fn export_to_pdf(
         let pdf_scale = mm_to_points / SCALE;
         cr.scale(pdf_scale, pdf_scale);
 
-        draw_page_content(&cr, &pango_ctx, page, images, svg_handles, None, false, false, SCALE);
+        draw_page_content(&cr, &pango_ctx, page, images, svg_handles, None, false, false, SCALE, &[]);
 
         cr.restore()?;
         cr.show_page()?;

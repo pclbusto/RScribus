@@ -58,6 +58,27 @@ impl AppModel {
         SCALE * self.zoom
     }
 
+    fn refresh_cursor_snapshot(&mut self) {
+        if self.selected_item_type() == Some(ItemType::TextFrame) {
+            if let Some(id) = self.selected_item_id.clone() {
+                if let Some((_, item)) = self.find_item(&id) {
+                    if let ItemContent::Text(ref tb) = item.content {
+                        let pos = if self.is_editing {
+                            tb.selection_range().map(|(s, _)| s).unwrap_or(tb.cursor_pos)
+                        } else {
+                            0
+                        };
+                        self.cursor_snapshot = tb.effective_snapshot_at(pos);
+                        self.cursor_alignment = tb.get_alignment();
+                    }
+                }
+            }
+        } else {
+            self.cursor_snapshot = AttrSnapshot::default();
+            self.cursor_alignment = TextAlign::default();
+        }
+    }
+
     fn find_item(&self, id: &str) -> Option<(usize, Item)> {
         for (page_idx, page) in self.document.pages.iter().enumerate() {
             if let Some(item) = page.items.iter().find(|i| i.id == id) {
@@ -379,8 +400,6 @@ impl Component for AppModel {
                             set_spacing: 4,
                             #[watch]
                             set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
-                            #[watch]
-                            set_sensitive: model.is_editing,
                             gtk::Box {
                                 add_css_class: "linked",
                                 set_orientation: gtk::Orientation::Horizontal,
@@ -427,8 +446,6 @@ impl Component for AppModel {
                             #[watch]
                             set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
                             #[watch]
-                            set_sensitive: model.is_editing,
-                            #[watch]
                             set_text: model.cursor_snapshot.family.as_deref().unwrap_or(""),
                             connect_activate[sender] => move |entry| {
                                 let f = entry.text().to_string();
@@ -442,8 +459,6 @@ impl Component for AppModel {
                             set_spacing: 6,
                             #[watch]
                             set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
-                            #[watch]
-                            set_sensitive: model.is_editing,
                             gtk::Label {
                                 set_label: "Tamaño:",
                             },
@@ -473,8 +488,6 @@ impl Component for AppModel {
                             add_css_class: "linked",
                             #[watch]
                             set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
-                            #[watch]
-                            set_sensitive: model.is_editing,
                             gtk::ToggleButton {
                                 set_icon_name: "format-justify-left-symbolic",
                                 set_tooltip_text: Some("Alinear izquierda"),
@@ -923,22 +936,8 @@ impl Component for AppModel {
         root: &Self::Root,
     ) {
         self.update(message, sender.clone(), root);
+        self.refresh_cursor_snapshot();
         self.update_view(widgets, sender);
-
-        if self.selected_item_type() == Some(ItemType::TextFrame) {
-            if let Some(id) = self.selected_item_id.clone() {
-                if let Some((_, item)) = self.find_item(&id) {
-                    if let ItemContent::Text(ref tb) = item.content {
-                        let pos = if self.is_editing { tb.cursor_pos } else { 0 };
-                        self.cursor_snapshot = tb.effective_snapshot_at(pos);
-                        self.cursor_alignment = tb.get_alignment();
-                    }
-                }
-            }
-        } else {
-            self.cursor_snapshot = AttrSnapshot::default();
-            self.cursor_alignment = TextAlign::default();
-        }
 
         if self.request_focus {
             self.request_focus = false;
@@ -1966,61 +1965,145 @@ impl Component for AppModel {
                 }
             }
             AppInput::SetBold(value) => {
-                if !self.is_editing { return; }
-                if let Some(tb) = self.get_editing_text_box_mut() {
-                    if tb.get_attr_at(tb.cursor_pos).bold != value {
-                        let (s, e) = tb.selection_or_word_range();
-                        if s < e { tb.apply_format(s, e, AttrValue::Bold(value)); }
+                let editing = self.is_editing;
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Text(ref mut tb) = item.content {
+                            if editing {
+                                let pos = tb.selection_range().map(|(s, _)| s).unwrap_or(tb.cursor_pos);
+                                if tb.get_attr_at(pos).bold != value {
+                                    let (s, e) = tb.selection_or_word_range();
+                                    if s < e { tb.apply_format(s, e, AttrValue::Bold(value)); }
+                                }
+                            } else {
+                                let len = tb.text.len();
+                                tb.apply_format(0, len, AttrValue::Bold(value));
+                                self.is_editing = true;
+                                *self.editing_flag.borrow_mut() = true;
+                            }
+                        }
                     }
                 }
+                self.request_focus = true;
             }
             AppInput::SetItalic(value) => {
-                if !self.is_editing { return; }
-                if let Some(tb) = self.get_editing_text_box_mut() {
-                    if tb.get_attr_at(tb.cursor_pos).italic != value {
-                        let (s, e) = tb.selection_or_word_range();
-                        if s < e { tb.apply_format(s, e, AttrValue::Italic(value)); }
+                let editing = self.is_editing;
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Text(ref mut tb) = item.content {
+                            if editing {
+                                let pos = tb.selection_range().map(|(s, _)| s).unwrap_or(tb.cursor_pos);
+                                if tb.get_attr_at(pos).italic != value {
+                                    let (s, e) = tb.selection_or_word_range();
+                                    if s < e { tb.apply_format(s, e, AttrValue::Italic(value)); }
+                                }
+                            } else {
+                                let len = tb.text.len();
+                                tb.apply_format(0, len, AttrValue::Italic(value));
+                                self.is_editing = true;
+                                *self.editing_flag.borrow_mut() = true;
+                            }
+                        }
                     }
                 }
+                self.request_focus = true;
             }
             AppInput::SetUnderline(value) => {
-                if !self.is_editing { return; }
-                if let Some(tb) = self.get_editing_text_box_mut() {
-                    if tb.get_attr_at(tb.cursor_pos).underline != value {
-                        let (s, e) = tb.selection_or_word_range();
-                        if s < e { tb.apply_format(s, e, AttrValue::Underline(value)); }
+                let editing = self.is_editing;
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Text(ref mut tb) = item.content {
+                            if editing {
+                                let pos = tb.selection_range().map(|(s, _)| s).unwrap_or(tb.cursor_pos);
+                                if tb.get_attr_at(pos).underline != value {
+                                    let (s, e) = tb.selection_or_word_range();
+                                    if s < e { tb.apply_format(s, e, AttrValue::Underline(value)); }
+                                }
+                            } else {
+                                let len = tb.text.len();
+                                tb.apply_format(0, len, AttrValue::Underline(value));
+                                self.is_editing = true;
+                                *self.editing_flag.borrow_mut() = true;
+                            }
+                        }
                     }
                 }
+                self.request_focus = true;
             }
             AppInput::SetFontFamily(family) => {
-                if !self.is_editing { return; }
-                if let Some(tb) = self.get_editing_text_box_mut() {
-                    let (s, e) = tb.selection_or_word_range();
-                    if s < e { tb.apply_format(s, e, AttrValue::Family(family)); }
-                }
-            }
-            AppInput::SetFontSize(size) => {
-                if !self.is_editing { return; }
-                if let Some(tb) = self.get_editing_text_box_mut() {
-                    let current = tb.effective_snapshot_at(tb.cursor_pos).size_pt.unwrap_or(11.0);
-                    if (size - current).abs() > 0.05 {
-                        let (s, e) = tb.selection_or_word_range();
-                        if s < e { tb.apply_format(s, e, AttrValue::Size(size)); }
+                let editing = self.is_editing;
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Text(ref mut tb) = item.content {
+                            if editing {
+                                let (s, e) = tb.selection_or_word_range();
+                                if s < e { tb.apply_format(s, e, AttrValue::Family(family)); }
+                            } else {
+                                let len = tb.text.len();
+                                tb.apply_format(0, len, AttrValue::Family(family));
+                                self.is_editing = true;
+                                *self.editing_flag.borrow_mut() = true;
+                            }
+                        }
                     }
                 }
+                self.request_focus = true;
+            }
+            AppInput::SetFontSize(size) => {
+                let editing = self.is_editing;
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Text(ref mut tb) = item.content {
+                            if editing {
+                                let pos = tb.selection_range().map(|(s, _)| s).unwrap_or(tb.cursor_pos);
+                                let current = tb.effective_snapshot_at(pos).size_pt.unwrap_or(11.0);
+                                if (size - current).abs() > 0.05 {
+                                    let (s, e) = tb.selection_or_word_range();
+                                    if s < e { tb.apply_format(s, e, AttrValue::Size(size)); }
+                                }
+                            } else {
+                                let len = tb.text.len();
+                                tb.apply_format(0, len, AttrValue::Size(size));
+                                self.is_editing = true;
+                                *self.editing_flag.borrow_mut() = true;
+                            }
+                        }
+                    }
+                }
+                self.request_focus = true;
             }
             AppInput::SetTextAlign(align) => {
-                if !self.is_editing { return; }
-                if let Some(tb) = self.get_editing_text_box_mut() {
-                    tb.set_alignment(align);
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Text(ref mut tb) = item.content {
+                            tb.set_alignment(align);
+                            if !self.is_editing {
+                                self.is_editing = true;
+                                *self.editing_flag.borrow_mut() = true;
+                            }
+                        }
+                    }
                 }
+                self.request_focus = true;
             }
             AppInput::ClearFormat => {
-                if !self.is_editing { return; }
-                if let Some(tb) = self.get_editing_text_box_mut() {
-                    let (s, e) = tb.selection_or_word_range();
-                    if s < e { tb.clear_format(s, e); }
+                let editing = self.is_editing;
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Text(ref mut tb) = item.content {
+                            if editing {
+                                let (s, e) = tb.selection_or_word_range();
+                                if s < e { tb.clear_format(s, e); }
+                            } else {
+                                let len = tb.text.len();
+                                tb.clear_format(0, len);
+                                self.is_editing = true;
+                                *self.editing_flag.borrow_mut() = true;
+                            }
+                        }
+                    }
                 }
+                self.request_focus = true;
             }
             AppInput::MaybeReflow(version) => {
                 if version == self.reflow_version {

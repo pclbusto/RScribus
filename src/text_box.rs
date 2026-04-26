@@ -37,6 +37,17 @@ pub struct TextAttribute {
     pub value: AttrValue,
 }
 
+/// One entry in the undo/redo history of a text frame.
+#[derive(Debug, Clone)]
+pub struct HistoryEntry {
+    pub text: String,
+    pub attributes: Vec<TextAttribute>,
+    pub alignment: TextAlign,
+    pub cursor_pos: usize,
+    pub selection_anchor: Option<usize>,
+    pub scroll_y: f64,
+}
+
 /// Snapshot of all format properties active at a single cursor position.
 #[derive(Debug, Clone, Default)]
 pub struct AttrSnapshot {
@@ -56,10 +67,13 @@ pub enum KeyAction {
     Handled,
     ExitEdit,
     RequestPaste,
+    RequestCut,
     MoveVertical { up: bool, extend: bool },
     FormatBold,
     FormatItalic,
     FormatUnderline,
+    Undo,
+    Redo,
 }
 
 // ── TextBox ───────────────────────────────────────────────────────────────────
@@ -91,6 +105,10 @@ pub struct TextBox {
     pub selection_anchor: Option<usize>,
     #[serde(skip)]
     pub scroll_y: f64,
+    #[serde(skip)]
+    pub undo_stack: Vec<HistoryEntry>,
+    #[serde(skip)]
+    pub redo_stack: Vec<HistoryEntry>,
 }
 
 impl Default for TextBox {
@@ -108,6 +126,8 @@ impl Default for TextBox {
             cursor_pos: 0,
             selection_anchor: None,
             scroll_y: 0.0,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 }
@@ -335,6 +355,75 @@ impl TextBox {
     }
 }
 
+// ── Undo / Redo ───────────────────────────────────────────────────────────────
+
+const UNDO_LIMIT: usize = 30;
+
+impl TextBox {
+    fn snapshot(&self) -> HistoryEntry {
+        HistoryEntry {
+            text: self.text.clone(),
+            attributes: self.attributes.clone(),
+            alignment: self.alignment,
+            cursor_pos: self.cursor_pos,
+            selection_anchor: self.selection_anchor,
+            scroll_y: self.scroll_y,
+        }
+    }
+
+    fn restore(&mut self, entry: HistoryEntry) {
+        self.text = entry.text;
+        self.attributes = entry.attributes;
+        self.alignment = entry.alignment;
+        self.cursor_pos = entry.cursor_pos;
+        self.selection_anchor = entry.selection_anchor;
+        self.scroll_y = entry.scroll_y;
+    }
+
+    fn snapshot_differs_from_last(&self, snap: &HistoryEntry) -> bool {
+        match self.undo_stack.last() {
+            None => true,
+            Some(last) => last.text != snap.text || last.alignment != snap.alignment
+                || last.attributes.len() != snap.attributes.len(),
+        }
+    }
+
+    /// Saves current state as an undo checkpoint and clears the redo stack.
+    /// Must be called BEFORE the action that will change the text, so the
+    /// stack holds the "state to return to" (not the already-modified state).
+    pub fn push_history(&mut self) {
+        let snap = self.snapshot();
+        if !self.snapshot_differs_from_last(&snap) { return; }
+        if self.undo_stack.len() >= UNDO_LIMIT {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(snap);
+        self.redo_stack.clear();
+    }
+
+    pub fn undo(&mut self) -> bool {
+        if let Some(prev) = self.undo_stack.pop() {
+            let current = self.snapshot();
+            self.redo_stack.push(current);
+            self.restore(prev);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn redo(&mut self) -> bool {
+        if let Some(next) = self.redo_stack.pop() {
+            let current = self.snapshot();
+            self.undo_stack.push(current);
+            self.restore(next);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 // ── Cursor & selection ────────────────────────────────────────────────────────
 
 impl TextBox {
@@ -531,11 +620,15 @@ impl TextBox {
             return match key {
                 gdk::Key::a | gdk::Key::A => { self.select_all(); KeyAction::Handled }
                 gdk::Key::c | gdk::Key::C => { self.copy_selection(); KeyAction::Handled }
-                gdk::Key::x | gdk::Key::X => { self.cut_selection(); KeyAction::Handled }
+                gdk::Key::x | gdk::Key::X => { self.copy_selection(); KeyAction::RequestCut }
                 gdk::Key::v | gdk::Key::V => KeyAction::RequestPaste,
                 gdk::Key::b | gdk::Key::B => KeyAction::FormatBold,
                 gdk::Key::i | gdk::Key::I => KeyAction::FormatItalic,
                 gdk::Key::u | gdk::Key::U => KeyAction::FormatUnderline,
+                gdk::Key::z | gdk::Key::Z => {
+                    if shift { KeyAction::Redo } else { KeyAction::Undo }
+                }
+                gdk::Key::y | gdk::Key::Y => KeyAction::Redo,
                 _ => KeyAction::Handled,
             };
         }

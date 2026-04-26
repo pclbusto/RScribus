@@ -44,6 +44,10 @@ pub struct AppModel {
     cursor_alignment: TextAlign,
     /// Monotone counter bumped on every text edit; used to discard stale reflow timeouts.
     reflow_version: u64,
+    /// Counter for undo-commit debounce (typing grouping).
+    undo_version: u64,
+    /// True while the user is in an active typing run (keys after the first don't push).
+    typing_run_active: bool,
     /// Active canvas drag-to-link operation.
     link_drag_active: bool,
     link_drag_source_id: Option<String>,
@@ -77,6 +81,33 @@ impl AppModel {
             self.cursor_snapshot = AttrSnapshot::default();
             self.cursor_alignment = TextAlign::default();
         }
+    }
+
+    /// Closes any active typing run and pushes the current state as an undo checkpoint.
+    /// Call BEFORE a format change, paste, or cut so that undo can return to this state.
+    fn flush_history(&mut self) {
+        self.typing_run_active = false;
+        if let Some(id) = self.selected_item_id.clone() {
+            if let Some((_, item)) = self.find_item_mut(&id) {
+                if let ItemContent::Text(ref mut tb) = item.content {
+                    tb.push_history();
+                }
+            }
+        }
+    }
+
+    /// Schedules a debounced history commit 400 ms after typing stops.
+    fn schedule_history_commit(&mut self, sender: &relm4::ComponentSender<Self>) {
+        self.undo_version = self.undo_version.wrapping_add(1);
+        let version = self.undo_version;
+        let s = sender.clone();
+        gtk::glib::timeout_add_local(
+            std::time::Duration::from_millis(400),
+            move || {
+                s.input(AppInput::MaybeCommitHistory(version));
+                gtk::glib::ControlFlow::Break
+            },
+        );
     }
 
     fn find_item(&self, id: &str) -> Option<(usize, Item)> {
@@ -213,6 +244,11 @@ pub enum AppInput {
     UnlinkFrame,
     /// Fired by the debounce timer; ignored if `version` no longer matches.
     MaybeReflow(u64),
+    Undo,
+    Redo,
+    CutText,
+    /// Fired by the undo-commit debounce; ignored if version doesn't match.
+    MaybeCommitHistory(u64),
 }
 
 #[derive(Debug)]
@@ -918,6 +954,8 @@ impl Component for AppModel {
             cursor_snapshot: AttrSnapshot::default(),
             cursor_alignment: TextAlign::default(),
             reflow_version: 0,
+            undo_version: 0,
+            typing_run_active: false,
             link_drag_active: false,
             link_drag_source_id: None,
             link_drag_start: None,
@@ -1292,6 +1330,7 @@ impl Component for AppModel {
             }
             AppInput::PasteText(text) => {
                 if !self.is_editing { return; }
+                self.flush_history(); // push pre-paste state, close typing run
                 if let Some(tb) = self.get_editing_text_box_mut() {
                     tb.insert_text(&text);
                 }
@@ -1327,13 +1366,34 @@ impl Component for AppModel {
                     }
                     return;
                 }
+
+                // Classify whether this key will modify text BEFORE calling handle_key,
+                // so we can push the pre-edit state to the undo stack first.
+                let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+                let will_modify = !ctrl && (
+                    matches!(key,
+                        gdk::Key::BackSpace | gdk::Key::Delete |
+                        gdk::Key::Return | gdk::Key::KP_Enter
+                    ) || key.to_unicode().map_or(false, |c| !c.is_control())
+                );
+
+                // Start of a new typing run: push "state before run" to undo stack.
+                if will_modify && !self.typing_run_active {
+                    self.typing_run_active = true;
+                    if let Some(tb) = self.get_editing_text_box_mut() {
+                        tb.push_history();
+                    }
+                }
+
                 let action = if let Some(tb) = self.get_editing_text_box_mut() {
                     tb.handle_key(key, state)
                 } else {
                     return;
                 };
+
                 match action {
                     KeyAction::ExitEdit => {
+                        self.typing_run_active = false;
                         self.is_editing = false;
                         *self.editing_flag.borrow_mut() = false;
                         if let Some(tb) = self.get_editing_text_box_mut() {
@@ -1353,6 +1413,9 @@ impl Component for AppModel {
                             }
                         });
                     }
+                    KeyAction::RequestCut => {
+                        sender.input(AppInput::CutText);
+                    }
                     KeyAction::MoveVertical { up, extend } => {
                         let frame_w_px = self.selected_item_id.as_ref()
                             .and_then(|id| self.find_item(id))
@@ -1371,7 +1434,19 @@ impl Component for AppModel {
                     KeyAction::FormatUnderline => {
                         sender.input(AppInput::SetUnderline(!self.cursor_snapshot.underline));
                     }
+                    KeyAction::Undo => {
+                        sender.input(AppInput::Undo);
+                        return;
+                    }
+                    KeyAction::Redo => {
+                        sender.input(AppInput::Redo);
+                        return;
+                    }
                     KeyAction::Handled => {}
+                }
+
+                if will_modify {
+                    self.schedule_history_commit(&sender);
                 }
 
                 if let Some(id) = self.selected_item_id.clone() {
@@ -1633,26 +1708,31 @@ impl Component for AppModel {
                                 if item.width < 1.0 { item.width = 1.0; }
                                 if item.height < 1.0 { item.height = 1.0; }
                             } else if is_moving {
-                                item.x = ix + dx;
-                                item.y = iy + dy;
-                                
-                                // Check if item should move to another page
-                                let page_gap = 20.0;
-                                let (off_x, off_y) = match layout {
-                                    PageLayout::Vertical => (0.0, page_idx as f64 * (doc_h + page_gap)),
-                                    PageLayout::Horizontal => (page_idx as f64 * (doc_w + page_gap), 0.0),
-                                };
-                                let abs_x_mm = off_x + item.x + item.width / 2.0;
-                                let abs_y_mm = off_y + item.y + item.height / 2.0;
+                                // Only move once the pointer has dragged more than 5 canvas pixels.
+                                // Prevents items from drifting on a click (which may fire drag_update
+                                // with tiny jitter, especially on first gesture after a document load).
+                                if offset_x * offset_x + offset_y * offset_y >= 25.0 {
+                                    item.x = ix + dx;
+                                    item.y = iy + dy;
 
-                                let target_page_idx = match layout {
-                                    PageLayout::Vertical => (abs_y_mm / (doc_h + page_gap)).floor() as usize,
-                                    PageLayout::Horizontal => (abs_x_mm / (doc_w + page_gap)).floor() as usize,
-                                };
-                                let target_page_idx = target_page_idx.min(self.document.pages.len().saturating_sub(1));
-                                
-                                if target_page_idx != page_idx {
-                                    item_moved_to_new_page = Some((page_idx, target_page_idx));
+                                    // Check if item should move to another page
+                                    let page_gap = 20.0;
+                                    let (off_x, off_y) = match layout {
+                                        PageLayout::Vertical => (0.0, page_idx as f64 * (doc_h + page_gap)),
+                                        PageLayout::Horizontal => (page_idx as f64 * (doc_w + page_gap), 0.0),
+                                    };
+                                    let abs_x_mm = off_x + item.x + item.width / 2.0;
+                                    let abs_y_mm = off_y + item.y + item.height / 2.0;
+
+                                    let target_page_idx = match layout {
+                                        PageLayout::Vertical => (abs_y_mm / (doc_h + page_gap)).floor() as usize,
+                                        PageLayout::Horizontal => (abs_x_mm / (doc_w + page_gap)).floor() as usize,
+                                    };
+                                    let target_page_idx = target_page_idx.min(self.document.pages.len().saturating_sub(1));
+
+                                    if target_page_idx != page_idx {
+                                        item_moved_to_new_page = Some((page_idx, target_page_idx));
+                                    }
                                 }
                             }
                         }
@@ -1941,6 +2021,17 @@ impl Component for AppModel {
                 self.last_save_path = Some(path);
                 self.selected_item_id = None;
                 self.is_editing = false;
+                self.drag_start = None;
+                self.drag_current = None;
+                self.is_moving = false;
+                self.active_handle = None;
+                self.initial_item_rect = None;
+                self.text_drag_active = false;
+                self.link_drag_active = false;
+                self.link_drag_source_id = None;
+                self.link_drag_start = None;
+                self.link_drag_current = None;
+                self.current_page = 0;
 
                 // Pre-load all images from the loaded document
                 for page in &self.document.pages {
@@ -1966,6 +2057,8 @@ impl Component for AppModel {
             }
             AppInput::SetBold(value) => {
                 let editing = self.is_editing;
+                self.flush_history(); // push pre-format state, close typing run
+                let mut need_enter_edit = false;
                 if let Some(id) = self.selected_item_id.clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
@@ -1978,16 +2071,21 @@ impl Component for AppModel {
                             } else {
                                 let len = tb.text.len();
                                 tb.apply_format(0, len, AttrValue::Bold(value));
-                                self.is_editing = true;
-                                *self.editing_flag.borrow_mut() = true;
+                                need_enter_edit = true;
                             }
                         }
                     }
+                }
+                if need_enter_edit {
+                    self.is_editing = true;
+                    *self.editing_flag.borrow_mut() = true;
                 }
                 self.request_focus = true;
             }
             AppInput::SetItalic(value) => {
                 let editing = self.is_editing;
+                self.flush_history(); // push pre-format state, close typing run
+                let mut need_enter_edit = false;
                 if let Some(id) = self.selected_item_id.clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
@@ -2000,16 +2098,21 @@ impl Component for AppModel {
                             } else {
                                 let len = tb.text.len();
                                 tb.apply_format(0, len, AttrValue::Italic(value));
-                                self.is_editing = true;
-                                *self.editing_flag.borrow_mut() = true;
+                                need_enter_edit = true;
                             }
                         }
                     }
+                }
+                if need_enter_edit {
+                    self.is_editing = true;
+                    *self.editing_flag.borrow_mut() = true;
                 }
                 self.request_focus = true;
             }
             AppInput::SetUnderline(value) => {
                 let editing = self.is_editing;
+                self.flush_history(); // push pre-format state, close typing run
+                let mut need_enter_edit = false;
                 if let Some(id) = self.selected_item_id.clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
@@ -2022,22 +2125,28 @@ impl Component for AppModel {
                             } else {
                                 let len = tb.text.len();
                                 tb.apply_format(0, len, AttrValue::Underline(value));
-                                self.is_editing = true;
-                                *self.editing_flag.borrow_mut() = true;
+                                need_enter_edit = true;
                             }
                         }
                     }
+                }
+                if need_enter_edit {
+                    self.is_editing = true;
+                    *self.editing_flag.borrow_mut() = true;
                 }
                 self.request_focus = true;
             }
             AppInput::SetFontFamily(family) => {
                 let editing = self.is_editing;
+                self.flush_history(); // push pre-format state, close typing run
                 if let Some(id) = self.selected_item_id.clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
                                 let (s, e) = tb.selection_or_word_range();
-                                if s < e { tb.apply_format(s, e, AttrValue::Family(family)); }
+                                if s < e {
+                                    tb.apply_format(s, e, AttrValue::Family(family));
+                                }
                             } else {
                                 let len = tb.text.len();
                                 tb.apply_format(0, len, AttrValue::Family(family));
@@ -2051,6 +2160,7 @@ impl Component for AppModel {
             }
             AppInput::SetFontSize(size) => {
                 let editing = self.is_editing;
+                self.flush_history(); // push pre-format state, close typing run
                 if let Some(id) = self.selected_item_id.clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
@@ -2059,7 +2169,9 @@ impl Component for AppModel {
                                 let current = tb.effective_snapshot_at(pos).size_pt.unwrap_or(11.0);
                                 if (size - current).abs() > 0.05 {
                                     let (s, e) = tb.selection_or_word_range();
-                                    if s < e { tb.apply_format(s, e, AttrValue::Size(size)); }
+                                    if s < e {
+                                        tb.apply_format(s, e, AttrValue::Size(size));
+                                    }
                                 }
                             } else {
                                 let len = tb.text.len();
@@ -2073,6 +2185,7 @@ impl Component for AppModel {
                 self.request_focus = true;
             }
             AppInput::SetTextAlign(align) => {
+                self.flush_history(); // push pre-format state, close typing run
                 if let Some(id) = self.selected_item_id.clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
@@ -2088,12 +2201,15 @@ impl Component for AppModel {
             }
             AppInput::ClearFormat => {
                 let editing = self.is_editing;
+                self.flush_history(); // push pre-format state, close typing run
                 if let Some(id) = self.selected_item_id.clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
                                 let (s, e) = tb.selection_or_word_range();
-                                if s < e { tb.clear_format(s, e); }
+                                if s < e {
+                                    tb.clear_format(s, e);
+                                }
                             } else {
                                 let len = tb.text.len();
                                 tb.clear_format(0, len);
@@ -2112,6 +2228,57 @@ impl Component for AppModel {
                             let sc = self.scale();
                             reflow_chain(&mut self.document, &id, sc);
                         }
+                    }
+                }
+            }
+            AppInput::MaybeCommitHistory(version) => {
+                if version == self.undo_version {
+                    self.typing_run_active = false;
+                }
+            }
+            AppInput::CutText => {
+                if !self.is_editing { return; }
+                self.flush_history(); // push pre-cut state, close typing run
+                if let Some(tb) = self.get_editing_text_box_mut() {
+                    tb.delete_selection();
+                }
+                // trigger reflow if in chain
+                if let Some(id) = self.selected_item_id.clone() {
+                    if is_in_chain(&self.document, &id) {
+                        let sc = self.scale();
+                        reflow_chain(&mut self.document, &id, sc);
+                    }
+                }
+            }
+            AppInput::Undo => {
+                if !self.is_editing { return; }
+                self.typing_run_active = false;
+                self.undo_version = self.undo_version.wrapping_add(1);
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Text(ref mut tb) = item.content {
+                            tb.undo();
+                        }
+                    }
+                    if is_in_chain(&self.document, &id) {
+                        let sc = self.scale();
+                        reflow_chain(&mut self.document, &id, sc);
+                    }
+                }
+            }
+            AppInput::Redo => {
+                if !self.is_editing { return; }
+                self.typing_run_active = false;
+                self.undo_version = self.undo_version.wrapping_add(1);
+                if let Some(id) = self.selected_item_id.clone() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Text(ref mut tb) = item.content {
+                            tb.redo();
+                        }
+                    }
+                    if is_in_chain(&self.document, &id) {
+                        let sc = self.scale();
+                        reflow_chain(&mut self.document, &id, sc);
                     }
                 }
             }

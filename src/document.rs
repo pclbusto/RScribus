@@ -23,9 +23,14 @@ pub struct Item {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    #[serde(default)]
     pub rotation: f64,
+    #[serde(default = "default_show_border")]
+    pub show_border: bool,
     pub content: ItemContent,
 }
+
+fn default_show_border() -> bool { true }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ItemContent {
@@ -54,13 +59,6 @@ pub enum ItemType {
     Shape,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Layer {
-    pub name: String,
-    pub visible: bool,
-    pub locked: bool,
-}
-
 impl Default for Document {
     fn default() -> Self {
         Self {
@@ -75,6 +73,7 @@ impl Default for Document {
                             width: 170.0,
                             height: 50.0,
                             rotation: 0.0,
+                            show_border: true,
                             content: ItemContent::Text(TextBox::new("Sample text for the first frame.".to_string())),
                         }
                     ],
@@ -90,16 +89,6 @@ impl Default for Page {
     fn default() -> Self {
         Self {
             items: Vec::new(),
-        }
-    }
-}
-
-impl Default for Layer {
-    fn default() -> Self {
-        Self {
-            name: String::from("Layer 1"),
-            visible: true,
-            locked: false,
         }
     }
 }

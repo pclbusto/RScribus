@@ -19,6 +19,7 @@
   - **Auto-save**: Never lose progress; changes are saved automatically when focus is lost.
 - 🔍 **Contextual Intelligence**: Right-click any element to see detailed statistics (paragraphs, lines, words, and characters).
 - 💾 **Persistence**: Documents are serialized using JSON for easy sharing and versioning.
+- 🖨️ **PDF Export**: Export the current document to PDF with vector-friendly page rendering.
 - 🎨 **Modern Aesthetics**: Built using `Libadwaita`, following the latest GNOME design guidelines for a clean, premium feel.
 
 ## 🚀 Technical Architecture
@@ -55,11 +56,10 @@ sudo apt install libgtk-4-dev libadwaita-1-dev libcairo2-dev libpango1.0-dev
 
 ## 📅 Roadmap
 
-- [ ] **Image Support**: Integration of `ImageFrame` for rich media layouts.
 - [ ] **Property Sidebar**: Fine-grained numerical editing for object positions and dimensions.
 - [ ] **Shapes**: Support for geometric primitives (rectangles, circles, etc.).
 - [ ] **Shortcuts**: Implementation of Delete/Duplicate and standard DTP shortcuts.
-- [ ] **Export**: PDF export functionality.
+- [ ] **Advanced Image Tools**: Crop, alignment guides, and richer fit/wrap controls for image frames.
 
 ## 📄 License
 

@@ -10,16 +10,21 @@ pub enum FitMode {
     FrameToImage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum WrapMode {
+    #[default]
+    Independent,
+    Block,
+    WrapLeft,
+    WrapRight,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ImageBox {
     pub image_path: Option<String>,
     pub fit_mode: FitMode,
-}
-
-impl ImageBox {
-    pub fn fit_mode(&self) -> FitMode {
-        self.fit_mode
-    }
+    #[serde(default)]
+    pub wrap_mode: WrapMode,
 }
 
 impl ImageBox {
@@ -42,12 +47,9 @@ impl ImageBox {
         w: f64,
         h: f64,
         is_selected: bool,
+        show_border: bool,
         image: Option<&cairo::ImageSurface>,
     ) {
-        cr.set_source_rgb(0.88, 0.88, 0.88);
-        cr.rectangle(0.0, 0.0, w, h);
-        cr.fill().unwrap();
-
         if let Some(surf) = image {
             cr.save().unwrap();
             cr.rectangle(0.0, 0.0, w, h);
@@ -60,18 +62,23 @@ impl ImageBox {
             cr.paint().unwrap();
             cr.restore().unwrap();
         } else {
+            cr.set_source_rgb(0.88, 0.88, 0.88);
+            cr.rectangle(0.0, 0.0, w, h);
+            cr.fill().unwrap();
             self.draw_placeholder(cr, w, h);
         }
 
-        if is_selected {
-            cr.set_source_rgb(0.0, 0.5, 1.0);
-            cr.set_line_width(2.0);
-        } else {
-            cr.set_source_rgb(0.3, 0.3, 0.3);
-            cr.set_line_width(1.0);
+        if is_selected || show_border {
+            if is_selected {
+                cr.set_source_rgb(0.0, 0.5, 1.0);
+                cr.set_line_width(2.0);
+            } else {
+                cr.set_source_rgb(0.3, 0.3, 0.3);
+                cr.set_line_width(1.0);
+            }
+            cr.rectangle(0.0, 0.0, w, h);
+            cr.stroke().unwrap();
         }
-        cr.rectangle(0.0, 0.0, w, h);
-        cr.stroke().unwrap();
     }
 
     fn draw_placeholder(&self, cr: &cairo::Context, w: f64, h: f64) {

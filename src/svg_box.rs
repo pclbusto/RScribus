@@ -22,22 +22,6 @@ pub struct SvgBox {
 }
 
 impl SvgBox {
-    pub fn new(svg_path: String) -> Self {
-        Self { svg_path, fit_mode: FitMode::default() }
-    }
-
-    pub fn path(&self) -> &str {
-        &self.svg_path
-    }
-
-    pub fn fit_mode(&self) -> FitMode {
-        self.fit_mode
-    }
-
-    pub fn set_fit_mode(&mut self, mode: FitMode) {
-        self.fit_mode = mode;
-    }
-
     /// Loads the SVG at `path` once to read its intrinsic dimensions.
     /// Returns (width_mm, height_mm). Falls back to 100×100 mm on any error.
     pub fn intrinsic_size(path: &str) -> (f64, f64) {
@@ -52,11 +36,6 @@ impl SvgBox {
             .unwrap_or((100.0, 100.0))
     }
 
-    /// Returns true when (x, y) is inside the bounding rectangle [0, w] × [0, h].
-    pub fn contains_point(&self, x: f64, y: f64, w: f64, h: f64) -> bool {
-        x >= 0.0 && y >= 0.0 && x <= w && y <= h
-    }
-
     /// Renders the SVG box into `cr`.
     /// The context must already be translated to the item's origin.
     /// Pass a pre-loaded `rsvg::SvgHandle`; `None` shows the placeholder.
@@ -66,6 +45,7 @@ impl SvgBox {
         w: f64,
         h: f64,
         is_selected: bool,
+        show_border: bool,
         handle: Option<&rsvg::SvgHandle>,
     ) {
         cr.set_source_rgb(0.92, 0.92, 0.92);
@@ -77,15 +57,17 @@ impl SvgBox {
             None => self.draw_placeholder(cr, w, h),
         }
 
-        if is_selected {
-            cr.set_source_rgb(0.0, 0.5, 1.0);
-            cr.set_line_width(2.0);
-        } else {
-            cr.set_source_rgb(0.3, 0.3, 0.3);
-            cr.set_line_width(1.0);
+        if is_selected || show_border {
+            if is_selected {
+                cr.set_source_rgb(0.0, 0.5, 1.0);
+                cr.set_line_width(2.0);
+            } else {
+                cr.set_source_rgb(0.3, 0.3, 0.3);
+                cr.set_line_width(1.0);
+            }
+            cr.rectangle(0.0, 0.0, w, h);
+            cr.stroke().unwrap();
         }
-        cr.rectangle(0.0, 0.0, w, h);
-        cr.stroke().unwrap();
     }
 
     fn draw_svg(&self, cr: &cairo::Context, w: f64, h: f64, handle: &rsvg::SvgHandle) {

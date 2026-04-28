@@ -4,11 +4,13 @@ use gtk::gdk;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use crate::app_dialogs::show_info_dialog;
+use crate::app_io::{export_pdf_dialog, open_project_dialog, save_project_dialog, show_preferences_dialog};
 use crate::document::{Document, Item, ItemContent, ItemType};
 use crate::text_box::{TextBox, KeyAction, AttrValue, AttrSnapshot, TextAlign, TextAttribute};
-use crate::image_box::{FitMode, ImageBox};
+use crate::image_box::{FitMode, ImageBox, WrapMode};
 use crate::svg_box::SvgBox;
-use crate::persistence::PersistenceManager;
+use crate::text_flow::PrecomputedFlowProvider;
 
 const SCALE: f64 = 3.0;
 
@@ -23,12 +25,18 @@ pub struct AppModel {
     current_page: usize,
     drag_start: Option<(f64, f64)>,
     drag_current: Option<(f64, f64)>,
-    selected_item_id: Option<String>,
-    initial_item_rect: Option<(f64, f64, f64, f64)>,
+    drag_offset: (f64, f64),
+    selected_item_ids: Vec<String>,
+    initial_item_rects: std::collections::HashMap<String, (f64, f64, f64, f64)>,
     active_handle: Option<usize>,
     is_moving: bool,
     popover_pos: (f64, f64),
     popover_visible: bool,
+    /// Number of upcoming DragStart events to swallow.
+    /// Menu actions can close the popover twice in practice
+    /// (explicit state change + GTK closed signal), so this is a counter
+    /// instead of a one-shot boolean.
+    pending_drag_start_swallows: u8,
     is_editing: bool,
     text_drag_active: bool,
     request_focus: bool,
@@ -55,6 +63,13 @@ pub struct AppModel {
     link_drag_start: Option<(f64, f64)>,
     /// Current mouse position in screen px during link drag.
     link_drag_current: Option<(f64, f64)>,
+    /// False after a document load until the canvas size_allocate fires,
+    /// so that DragStart is ignored while GTK's layout pass is in flight.
+    canvas_ready: bool,
+    /// Pre-computed text-flow providers, keyed by text-frame item ID.
+    /// Rebuilt whenever an image's WrapMode, position, or size changes.
+    flow_providers: HashMap<String, PrecomputedFlowProvider>,
+    autoscroll_timer: Option<gtk::glib::SourceId>,
 }
 
 impl AppModel {
@@ -62,9 +77,18 @@ impl AppModel {
         SCALE * self.zoom
     }
 
+    fn swallow_upcoming_drag_start(&mut self) {
+        self.pending_drag_start_swallows = self.pending_drag_start_swallows.saturating_add(1);
+    }
+
+    fn close_popover_and_skip_drag(&mut self) {
+        self.popover_visible = false;
+        self.swallow_upcoming_drag_start();
+    }
+
     fn refresh_cursor_snapshot(&mut self) {
         if self.selected_item_type() == Some(ItemType::TextFrame) {
-            if let Some(id) = self.selected_item_id.clone() {
+            if let Some(id) = self.selected_item_ids.first().cloned() {
                 if let Some((_, item)) = self.find_item(&id) {
                     if let ItemContent::Text(ref tb) = item.content {
                         let pos = if self.is_editing {
@@ -87,7 +111,7 @@ impl AppModel {
     /// Call BEFORE a format change, paste, or cut so that undo can return to this state.
     fn flush_history(&mut self) {
         self.typing_run_active = false;
-        if let Some(id) = self.selected_item_id.clone() {
+        if let Some(id) = self.selected_item_ids.first().cloned() {
             if let Some((_, item)) = self.find_item_mut(&id) {
                 if let ItemContent::Text(ref mut tb) = item.content {
                     tb.push_history();
@@ -129,7 +153,7 @@ impl AppModel {
     }
 
     fn selected_has_link(&self) -> bool {
-        self.selected_item_id.as_ref()
+        self.selected_item_ids.first()
             .and_then(|id| self.find_item(id))
             .map(|(_, item)| {
                 if let ItemContent::Text(tb) = &item.content {
@@ -140,16 +164,176 @@ impl AppModel {
     }
 
     fn selected_item_type(&self) -> Option<ItemType> {
-        let id = self.selected_item_id.as_ref()?;
+        let id = self.selected_item_ids.first()?;
         self.find_item(id).map(|(_, item)| item.content.item_type())
     }
 
     fn get_editing_text_box_mut(&mut self) -> Option<&mut TextBox> {
-        let id = self.selected_item_id.clone()?;
+        let id = self.selected_item_ids.first()?.clone();
         let (_, item) = self.find_item_mut(&id)?;
         match &mut item.content {
             ItemContent::Text(tb) => Some(tb),
             _ => None,
+        }
+    }
+
+    fn process_drag(&mut self) {
+        let (offset_x, offset_y) = self.drag_offset;
+
+        if self.link_drag_active {
+            if let Some((sx, sy)) = self.link_drag_start {
+                self.link_drag_current = Some((sx + offset_x, sy + offset_y));
+            }
+            return;
+        }
+
+        if self.text_drag_active {
+            if let Some((sx, sy)) = self.drag_start {
+                self.drag_current = Some((sx + offset_x, sy + offset_y));
+                let x_mm = (sx + offset_x) / self.scale();
+                let y_mm = (sy + offset_y) / self.scale();
+
+                let hit_data = if let Some(id) = self.selected_item_ids.first() {
+                    self.find_item(id).map(|(page_idx, item)| {
+                        let (off_x, off_y) = self.get_page_offset(page_idx);
+                        let local_x = x_mm - off_x;
+                        let local_y = y_mm - off_y;
+                        let pos = if let ItemContent::Text(ref tb) = item.content {
+                            tb.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                        } else { 0 };
+                        (pos, item.width * SCALE, item.height * SCALE)
+                    })
+                } else { None };
+
+                if let Some((pos, w, h)) = hit_data {
+                    let pango_ctx = make_pango_ctx();
+                    if let Some(tb) = self.get_editing_text_box_mut() {
+                        tb.cursor_pos = pos;
+                        let s = tb.ensure_cursor_visible(&pango_ctx, w, h, SCALE);
+                        tb.scroll_y = s;
+                    }
+                }
+            }
+            return;
+        }
+
+        if let Some((sx, sy)) = self.drag_start {
+            self.drag_current = Some((sx + offset_x, sy + offset_y));
+            let dx = offset_x / self.scale();
+            let dy = offset_y / self.scale();
+            
+            let active_handle = self.active_handle;
+            let is_moving = self.is_moving;
+
+            if active_handle.is_some() {
+                if let Some(id) = self.selected_item_ids.first().cloned() {
+                    if let Some(&(ix, iy, iw, ih)) = self.initial_item_rects.get(&id) {
+                        // Pre-calculate image ratio if needed
+                        let image_ratio = if let Some((_, item)) = self.find_item(&id) {
+                            if let ItemContent::Image(ib) = &item.content {
+                                if ib.fit_mode == FitMode::FrameToImage {
+                                    ib.image_path.as_ref().and_then(|path| {
+                                        self.image_surfaces.get(path).map(|surf| surf.width() as f64 / surf.height() as f64)
+                                    })
+                                } else { None }
+                            } else { None }
+                        } else { None };
+
+                        if let Some((_page_idx, item)) = self.find_item_mut(&id) {
+                            let handle_idx = active_handle.unwrap();
+                            match handle_idx {
+                                0 => { item.x = ix + dx; item.y = iy + dy; item.width = iw - dx; item.height = ih - dy; }
+                                1 => { item.y = iy + dy; item.height = ih - dy; }
+                                2 => { item.y = iy + dy; item.width = iw + dx; item.height = ih - dy; }
+                                3 => { item.width = iw + dx; }
+                                4 => { item.width = iw + dx; item.height = ih + dy; }
+                                5 => { item.height = ih + dy; }
+                                6 => { item.x = ix + dx; item.width = iw - dx; item.height = ih + dy; }
+                                7 => { item.x = ix + dx; item.width = iw - dx; }
+                                _ => {}
+                            }
+
+                            if let Some(ratio) = image_ratio {
+                                match handle_idx {
+                                    3 | 7 | 4 | 6 => { item.height = item.width / ratio; }
+                                    1 | 5 => { item.width = item.height * ratio; }
+                                    0 | 2 => { item.width = item.height * ratio; }
+                                    _ => {}
+                                }
+                            }
+
+                            if item.width < 1.0 { item.width = 1.0; }
+                            if item.height < 1.0 { item.height = 1.0; }
+                        }
+
+                        self.rebuild_flow_providers();
+                    }
+                }
+            } else if is_moving {
+                // We don't check for offset_x*offset_x + offset_y*offset_y >= 100.0 here 
+                // because autoscroll might move it by smaller increments. 
+                // We should probably check it in the DragUpdate message handler instead.
+                let mut moves = Vec::new();
+                let ids = self.selected_item_ids.clone();
+                for id in &ids {
+                    if let Some(&(ix, iy, _iw, _ih)) = self.initial_item_rects.get(id) {
+                        let page_layout = self.page_layout;
+                        let doc_height = self.document.height;
+                        let doc_width = self.document.width;
+
+                        if let Some((page_idx, item)) = self.find_item_mut(id) {
+                            item.x = ix + dx;
+                            item.y = iy + dy;
+
+                            // Check for page move
+                            let page_gap = 20.0;
+                            let (off_x, off_y) = match page_layout {
+                                PageLayout::Vertical => (0.0, page_idx as f64 * (doc_height + page_gap)),
+                                PageLayout::Horizontal => (page_idx as f64 * (doc_width + page_gap), 0.0),
+                            };
+                            let abs_x_mm = off_x + item.x + item.width / 2.0;
+                            let abs_y_mm = off_y + item.y + item.height / 2.0;
+
+                            let target_page_idx = match page_layout {
+                                PageLayout::Vertical => (abs_y_mm / (doc_height + page_gap)).floor() as usize,
+                                PageLayout::Horizontal => (abs_x_mm / (doc_width + page_gap)).floor() as usize,
+                            };
+                            let target_page_idx = target_page_idx.min(self.document.pages.len().saturating_sub(1));
+
+                            if target_page_idx != page_idx {
+                                moves.push((id.clone(), page_idx, target_page_idx));
+                            }
+                        }
+                    }
+                }
+
+                for (id, old_idx, new_idx) in moves {
+                    if let Some(old_page) = self.document.pages.get_mut(old_idx) {
+                        if let Some(pos) = old_page.items.iter().position(|i| i.id == id) {
+                            let mut item = old_page.items.remove(pos);
+                            let (old_off_x, old_off_y) = self.get_page_offset(old_idx);
+                            let (new_off_x, new_off_y) = self.get_page_offset(new_idx);
+                            let abs_x = old_off_x + item.x;
+                            let abs_y = old_off_y + item.y;
+                            item.x = abs_x - new_off_x;
+                            item.y = abs_y - new_off_y;
+                            
+                            if let Some(new_page) = self.document.pages.get_mut(new_idx) {
+                                new_page.items.push(item);
+                                // Update initial rect to reflect new page origin
+                                if let Some(rect) = self.initial_item_rects.get_mut(&id) {
+                                    let abs_ix = old_off_x + rect.0;
+                                    let abs_iy = old_off_y + rect.1;
+                                    rect.0 = abs_ix - new_off_x;
+                                    rect.1 = abs_iy - new_off_y;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                self.rebuild_flow_providers();
+            }
         }
     }
 
@@ -191,18 +375,16 @@ impl AppModel {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AppInput {
     AddPage,
-    DragStart(f64, f64),
+    DragStart(f64, f64, gdk::ModifierType),
     DragUpdate(f64, f64),
     DragEnd,
-    SelectNone,
     RightClick(f64, f64),
     DoubleClick(f64, f64),
     ClosePopover,
     StartEdit,
-    ExitEdit,
     TextKeyPressed(gdk::Key, gdk::ModifierType),
     PasteText(String),
     Zoom(f64),
@@ -210,7 +392,6 @@ pub enum AppInput {
     ImportImage,
     ImageLoaded(String),
     FitFrameToImage,
-    FitImageToFrame,
     SetImageFitMode(crate::image_box::FitMode),
     ImportSvg,
     SvgLoaded(String),
@@ -242,6 +423,8 @@ pub enum AppInput {
     ClearFormat,
     LinkTo(String),
     UnlinkFrame,
+    SetWrapMode(WrapMode),
+    SetShowBorder(bool),
     /// Fired by the debounce timer; ignored if `version` no longer matches.
     MaybeReflow(u64),
     Undo,
@@ -249,6 +432,10 @@ pub enum AppInput {
     CutText,
     /// Fired by the undo-commit debounce; ignored if version doesn't match.
     MaybeCommitHistory(u64),
+    /// Fired by size_allocate after a document load; unlocks DragStart.
+    CanvasReady,
+    Autoscroll,
+    AdjustDragOffset(f64, f64),
 }
 
 #[derive(Debug)]
@@ -406,7 +593,7 @@ impl Component for AppModel {
                         gtk::Separator {},
                         gtk::Label {
                             #[watch]
-                            set_label: &format!("Selected: {}", model.selected_item_id.as_deref().unwrap_or("None")),
+                            set_label: &format!("Selected: {}", model.selected_item_ids.first().map(|s| s.as_str()).unwrap_or("None")),
                             set_ellipsize: gtk::pango::EllipsizeMode::End,
                             add_css_class: "caption",
                         },
@@ -579,6 +766,7 @@ impl Component for AppModel {
                         },
                     },
 
+                    #[name = "scrolled_window"]
                     #[wrap(Some)]
                     set_content = &gtk::ScrolledWindow {
                         set_hexpand: true,
@@ -623,7 +811,7 @@ impl Component for AppModel {
                                         let doc = model.document.clone();
                                         let d_start = model.drag_start;
                                         let d_current = model.drag_current;
-                                        let selected = model.selected_item_id.clone();
+                                        let selected = model.selected_item_ids.clone();
                                         let editing = model.is_editing;
                                         let zoom = model.zoom;
                                         let layout = model.page_layout;
@@ -632,8 +820,9 @@ impl Component for AppModel {
                                         let link_drag = if model.link_drag_active {
                                             model.link_drag_start.zip(model.link_drag_current)
                                         } else { None };
+                                        let flow_providers = model.flow_providers.clone();
                                         move |_area, cr, _w, _h| {
-                                            draw_canvas(cr, &doc, d_start, d_current, selected.clone(), editing, &images, &svgs, zoom, layout, link_drag);
+                                            draw_canvas(cr, &doc, d_start, d_current, &selected, editing, &images, &svgs, zoom, layout, link_drag, &flow_providers);
                                         }
                                     },
 
@@ -650,8 +839,9 @@ impl Component for AppModel {
                                     },
 
                                     add_controller = gtk::GestureDrag {
-                                        connect_drag_begin[sender] => move |_gesture, x, y| {
-                                            sender.input(AppInput::DragStart(x, y));
+                                        connect_drag_begin[sender] => move |gesture, x, y| {
+                                            let state = gesture.current_event().map(|e| e.modifier_state()).unwrap_or(gdk::ModifierType::empty());
+                                            sender.input(AppInput::DragStart(x, y, state));
                                         },
                                         connect_drag_update[sender] => move |_gesture, offset_x, offset_y| {
                                             sender.input(AppInput::DragUpdate(offset_x, offset_y));
@@ -711,7 +901,7 @@ impl Component for AppModel {
                                         gtk::Separator {},
                                         gtk::Label {
                                             #[watch]
-                                            set_label: &get_info_text(&model.document, &model.selected_item_id),
+                                            set_label: &get_info_text(&model.document, &model.selected_item_ids),
                                             set_xalign: 0.0,
                                         },
 
@@ -720,7 +910,7 @@ impl Component for AppModel {
                                             set_label: "Edit Text",
                                             add_css_class: "suggested-action",
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::TextFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::TextFrame),
                                             connect_clicked => AppInput::StartEdit,
                                         },
 
@@ -729,33 +919,33 @@ impl Component for AppModel {
                                             set_label: "Import Image",
                                             add_css_class: "suggested-action",
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::ImageFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::ImageFrame),
                                             connect_clicked => AppInput::ImportImage,
                                         },
 
                                         // Adjust Image section (only when ImageFrame has an image)
                                         gtk::Separator {
                                             #[watch]
-                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_id),
+                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_ids),
                                         },
                                         gtk::Label {
                                             set_label: "Adjust Image",
                                             add_css_class: "heading",
                                             set_xalign: 0.0,
                                             #[watch]
-                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_id),
+                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_ids),
                                         },
                                         gtk::Box {
                                             set_orientation: gtk::Orientation::Horizontal,
                                             set_spacing: 4,
                                             add_css_class: "linked",
                                             #[watch]
-                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_id),
+                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_ids),
 
                                             gtk::ToggleButton {
                                                 set_label: "Stretch",
                                                 #[watch]
-                                                set_active: get_selected_fit_mode(&model.document, &model.selected_item_id) == Some(crate::image_box::FitMode::ImageToFrame),
+                                                set_active: get_selected_fit_mode(&model.document, &model.selected_item_ids) == Some(crate::image_box::FitMode::ImageToFrame),
                                                 connect_toggled[sender] => move |btn| {
                                                     if btn.is_active() {
                                                         sender.input(AppInput::SetImageFitMode(crate::image_box::FitMode::ImageToFrame));
@@ -765,7 +955,7 @@ impl Component for AppModel {
                                             gtk::ToggleButton {
                                                 set_label: "Proportional",
                                                 #[watch]
-                                                set_active: get_selected_fit_mode(&model.document, &model.selected_item_id) == Some(crate::image_box::FitMode::FrameToImage),
+                                                set_active: get_selected_fit_mode(&model.document, &model.selected_item_ids) == Some(crate::image_box::FitMode::FrameToImage),
                                                 connect_toggled[sender] => move |btn| {
                                                     if btn.is_active() {
                                                         sender.input(AppInput::SetImageFitMode(crate::image_box::FitMode::FrameToImage));
@@ -776,8 +966,65 @@ impl Component for AppModel {
                                         gtk::Button {
                                             set_label: "Reset to Original Size",
                                             #[watch]
-                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_id),
+                                            set_visible: selected_image_frame_has_image(&model.document, &model.selected_item_ids),
                                             connect_clicked => AppInput::FitFrameToImage,
+                                        },
+
+                                        // Text-wrap mode
+                                        gtk::Separator {
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::ImageFrame),
+                                        },
+                                        gtk::Label {
+                                            set_label: "Ajuste de texto",
+                                            add_css_class: "heading",
+                                            set_xalign: 0.0,
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::ImageFrame),
+                                        },
+                                        gtk::Box {
+                                            set_orientation: gtk::Orientation::Horizontal,
+                                            set_spacing: 4,
+                                            add_css_class: "linked",
+                                            #[watch]
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::ImageFrame),
+
+                                            gtk::ToggleButton {
+                                                set_label: "Libre",
+                                                set_tooltip_text: Some("La imagen flota libre sin afectar el texto"),
+                                                #[watch]
+                                                set_active: get_selected_wrap_mode(&model.document, &model.selected_item_ids) == Some(WrapMode::Independent),
+                                                connect_toggled[sender] => move |btn| {
+                                                    if btn.is_active() { sender.input(AppInput::SetWrapMode(WrapMode::Independent)); }
+                                                },
+                                            },
+                                            gtk::ToggleButton {
+                                                set_label: "Bloque",
+                                                set_tooltip_text: Some("El texto fluye solo arriba y abajo de la imagen"),
+                                                #[watch]
+                                                set_active: get_selected_wrap_mode(&model.document, &model.selected_item_ids) == Some(WrapMode::Block),
+                                                connect_toggled[sender] => move |btn| {
+                                                    if btn.is_active() { sender.input(AppInput::SetWrapMode(WrapMode::Block)); }
+                                                },
+                                            },
+                                            gtk::ToggleButton {
+                                                set_label: "Izq.",
+                                                set_tooltip_text: Some("Imagen a la izquierda, texto a la derecha"),
+                                                #[watch]
+                                                set_active: get_selected_wrap_mode(&model.document, &model.selected_item_ids) == Some(WrapMode::WrapLeft),
+                                                connect_toggled[sender] => move |btn| {
+                                                    if btn.is_active() { sender.input(AppInput::SetWrapMode(WrapMode::WrapLeft)); }
+                                                },
+                                            },
+                                            gtk::ToggleButton {
+                                                set_label: "Der.",
+                                                set_tooltip_text: Some("Imagen a la derecha, texto a la izquierda"),
+                                                #[watch]
+                                                set_active: get_selected_wrap_mode(&model.document, &model.selected_item_ids) == Some(WrapMode::WrapRight),
+                                                connect_toggled[sender] => move |btn| {
+                                                    if btn.is_active() { sender.input(AppInput::SetWrapMode(WrapMode::WrapRight)); }
+                                                },
+                                            },
                                         },
 
                                         // SvgFrame actions
@@ -785,33 +1032,33 @@ impl Component for AppModel {
                                             set_label: "Import SVG",
                                             add_css_class: "suggested-action",
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::SvgFrame),
                                             connect_clicked => AppInput::ImportSvg,
                                         },
 
                                         // SVG Fit Mode section
                                         gtk::Separator {
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::SvgFrame),
                                         },
                                         gtk::Label {
                                             set_label: "SVG Fit Mode",
                                             add_css_class: "heading",
                                             set_xalign: 0.0,
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::SvgFrame),
                                         },
                                         gtk::Box {
                                             set_orientation: gtk::Orientation::Horizontal,
                                             set_spacing: 4,
                                             add_css_class: "linked",
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::SvgFrame),
 
                                             gtk::ToggleButton {
                                                 set_label: "Prop.",
                                                 #[watch]
-                                                set_active: get_selected_svg_fit_mode(&model.document, &model.selected_item_id) == Some(crate::svg_box::FitMode::Proportional),
+                                                set_active: get_selected_svg_fit_mode(&model.document, &model.selected_item_ids) == Some(crate::svg_box::FitMode::Proportional),
                                                 connect_toggled[sender] => move |btn| {
                                                     if btn.is_active() {
                                                         sender.input(AppInput::SetSvgFitMode(crate::svg_box::FitMode::Proportional));
@@ -821,7 +1068,7 @@ impl Component for AppModel {
                                             gtk::ToggleButton {
                                                 set_label: "Original",
                                                 #[watch]
-                                                set_active: get_selected_svg_fit_mode(&model.document, &model.selected_item_id) == Some(crate::svg_box::FitMode::Original),
+                                                set_active: get_selected_svg_fit_mode(&model.document, &model.selected_item_ids) == Some(crate::svg_box::FitMode::Original),
                                                 connect_toggled[sender] => move |btn| {
                                                     if btn.is_active() {
                                                         sender.input(AppInput::SetSvgFitMode(crate::svg_box::FitMode::Original));
@@ -831,7 +1078,7 @@ impl Component for AppModel {
                                             gtk::ToggleButton {
                                                 set_label: "Stretch",
                                                 #[watch]
-                                                set_active: get_selected_svg_fit_mode(&model.document, &model.selected_item_id) == Some(crate::svg_box::FitMode::Stretch),
+                                                set_active: get_selected_svg_fit_mode(&model.document, &model.selected_item_ids) == Some(crate::svg_box::FitMode::Stretch),
                                                 connect_toggled[sender] => move |btn| {
                                                     if btn.is_active() {
                                                         sender.input(AppInput::SetSvgFitMode(crate::svg_box::FitMode::Stretch));
@@ -842,56 +1089,70 @@ impl Component for AppModel {
                                         gtk::Button {
                                             set_label: "Fit Frame to SVG",
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::SvgFrame),
                                             connect_clicked => AppInput::FitFrameToSvg,
                                         },
                                         gtk::Button {
                                             set_label: "Refresh SVG",
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::SvgFrame),
                                             connect_clicked => AppInput::RefreshSvg,
                                         },
                                         gtk::Button {
                                             set_label: "Open in External Editor",
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::SvgFrame),
                                             connect_clicked => AppInput::OpenExternalEditor,
                                         },
                                         gtk::Button {
                                             #[watch]
                                             set_label: if model.svg_editor_path.is_some() { "Change SVG Editor" } else { "Set SVG Editor Path" },
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::SvgFrame),
                                             connect_clicked => AppInput::ChooseSvgEditor,
                                         },
                                         gtk::Label {
                                             #[watch]
-                                            set_label: &get_svg_path_info(&model.document, &model.selected_item_id),
+                                            set_label: &get_svg_path_info(&model.document, &model.selected_item_ids),
                                             set_ellipsize: gtk::pango::EllipsizeMode::Middle,
                                             set_max_width_chars: 40,
                                             add_css_class: "caption",
                                             #[watch]
-                                            set_visible: is_selected_type(&model.document, &model.selected_item_id, &ItemType::SvgFrame),
+                                            set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::SvgFrame),
                                         },
 
-                                        // Z-Order section
+                                        gtk::Separator {},
+                                        gtk::Label {
+                                            set_label: "Ajustes de marco",
+                                            add_css_class: "heading",
+                                            set_xalign: 0.0,
+                                        },
+                                        gtk::CheckButton {
+                                            set_label: Some("Mostrar borde"),
+                                            #[watch]
+                                            set_active: get_selected_show_border(&model.document, &model.selected_item_ids),
+                                            connect_toggled[sender] => move |btn| {
+                                                sender.input(AppInput::SetShowBorder(btn.is_active()));
+                                            },
+                                        },
+
                                         gtk::Separator {
                                             #[watch]
-                                            set_visible: model.selected_item_id.is_some(),
+                                            set_visible: !model.selected_item_ids.is_empty(),
                                         },
                                         gtk::Label {
                                             set_label: "Z-Order",
                                             add_css_class: "heading",
                                             set_xalign: 0.0,
                                             #[watch]
-                                            set_visible: model.selected_item_id.is_some(),
+                                            set_visible: !model.selected_item_ids.is_empty(),
                                         },
                                         gtk::Box {
                                             set_orientation: gtk::Orientation::Horizontal,
                                             set_spacing: 4,
                                             add_css_class: "linked",
                                             #[watch]
-                                            set_visible: model.selected_item_id.is_some(),
+                                            set_visible: !model.selected_item_ids.is_empty(),
 
                                             gtk::Button {
                                                 set_icon_name: "go-top-symbolic",
@@ -934,12 +1195,14 @@ impl Component for AppModel {
             current_page: 0,
             drag_start: None,
             drag_current: None,
-            selected_item_id: None,
-            initial_item_rect: None,
+            drag_offset: (0.0, 0.0),
+            selected_item_ids: Vec::new(),
+            initial_item_rects: std::collections::HashMap::new(),
             active_handle: None,
             is_moving: false,
             popover_pos: (0.0, 0.0),
             popover_visible: false,
+            pending_drag_start_swallows: 0,
             is_editing: false,
             text_drag_active: false,
             request_focus: false,
@@ -960,6 +1223,9 @@ impl Component for AppModel {
             link_drag_source_id: None,
             link_drag_start: None,
             link_drag_current: None,
+            canvas_ready: true,
+            flow_providers: HashMap::new(),
+            autoscroll_timer: None,
         };
 
         let widgets = view_output!();
@@ -973,9 +1239,82 @@ impl Component for AppModel {
         sender: ComponentSender<Self>,
         root: &Self::Root,
     ) {
-        self.update(message, sender.clone(), root);
+        let is_project_loaded = matches!(message, AppInput::ProjectLoaded(..));
+
+        self.update(message.clone(), sender.clone(), root);
         self.refresh_cursor_snapshot();
-        self.update_view(widgets, sender);
+        self.update_view(widgets, sender.clone());
+
+        // Autoscroll logic
+        if matches!(message, AppInput::DragUpdate(..) | AppInput::Autoscroll) {
+            let scroll_threshold = 50.0;
+            let scroll_speed = 15.0;
+            let mut delta_v = 0.0;
+            let mut delta_h = 0.0;
+
+            if (self.is_moving || self.active_handle.is_some()) && self.drag_current.is_some() {
+                let vadj = widgets.scrolled_window.vadjustment();
+                let hadj = widgets.scrolled_window.hadjustment();
+                let (mx, my) = self.drag_current.unwrap();
+
+                // Vertical scroll
+                if my < vadj.value() + scroll_threshold {
+                    delta_v = -scroll_speed;
+                } else if my > vadj.value() + vadj.page_size() - scroll_threshold {
+                    delta_v = scroll_speed;
+                }
+
+                // Horizontal scroll
+                if mx < hadj.value() + scroll_threshold {
+                    delta_h = -scroll_speed;
+                } else if mx > hadj.value() + hadj.page_size() - scroll_threshold {
+                    delta_h = scroll_speed;
+                }
+
+                if delta_v != 0.0 || delta_h != 0.0 {
+                    let old_v = vadj.value();
+                    let old_h = hadj.value();
+                    vadj.set_value((old_v + delta_v).clamp(vadj.lower(), vadj.upper() - vadj.page_size()));
+                    hadj.set_value((old_h + delta_h).clamp(hadj.lower(), hadj.upper() - hadj.page_size()));
+                    
+                    let actual_dv = vadj.value() - old_v;
+                    let actual_dh = hadj.value() - old_h;
+
+                    if actual_dv != 0.0 || actual_dh != 0.0 {
+                        sender.input(AppInput::AdjustDragOffset(actual_dh, actual_dv));
+                        
+                        if self.autoscroll_timer.is_none() {
+                            let s = sender.clone();
+                            self.autoscroll_timer = Some(gtk::glib::timeout_add_local_once(
+                                std::time::Duration::from_millis(20),
+                                move || {
+                                    s.input(AppInput::Autoscroll);
+                                }
+                            ));
+                        }
+                    } else {
+                        self.autoscroll_timer = None;
+                    }
+                } else {
+                    self.autoscroll_timer = None;
+                }
+            } else {
+                self.autoscroll_timer = None;
+            }
+        } else if matches!(message, AppInput::DragEnd | AppInput::DragStart(..)) {
+            self.autoscroll_timer = None;
+        }
+
+        if is_project_loaded {
+            // Schedule CanvasReady one frame after the load.  The GTK layout
+            // pass runs before this timeout fires, so by the time DragStart
+            // is unblocked the canvas origin is correctly calibrated.
+            let s = sender.clone();
+            gtk::glib::timeout_add_local_once(
+                std::time::Duration::from_millis(50),
+                move || { s.input(AppInput::CanvasReady); },
+            );
+        }
 
         if self.request_focus {
             self.request_focus = false;
@@ -989,22 +1328,13 @@ impl Component for AppModel {
                 self.page_layout = layout;
             }
             AppInput::ShowPreferences => {
-                let dialog = adw::MessageDialog::builder()
-                    .heading("Preferences")
-                    .body("RScribus Preferences\n\n(This is a placeholder for actual preferences settings)")
-                    .transient_for(root)
-                    .build();
-                dialog.add_response("close", "Close");
-                dialog.present();
+                show_preferences_dialog(root);
             }
             AppInput::AddPage => {
                 self.document.pages.push(crate::document::Page::default());
             }
-            AppInput::SelectNone => {
-                self.selected_item_id = None;
-            }
             AppInput::ClosePopover => {
-                self.popover_visible = false;
+                self.close_popover_and_skip_drag();
             }
             AppInput::SetCreateFrameType(ft) => {
                 self.create_frame_type = ft;
@@ -1019,9 +1349,9 @@ impl Component for AppModel {
                     self.is_editing = true;
                     *self.editing_flag.borrow_mut() = true;
                     self.request_focus = true;
-                    self.popover_visible = false;
+                    self.close_popover_and_skip_drag();
 
-                    let item_dims = self.selected_item_id.as_ref()
+                    let item_dims = self.selected_item_ids.first()
                         .and_then(|id| self.find_item(id))
                         .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
                     if let Some((w, h)) = item_dims {
@@ -1033,16 +1363,8 @@ impl Component for AppModel {
                     }
                 }
             }
-            AppInput::ExitEdit => {
-                self.is_editing = false;
-                *self.editing_flag.borrow_mut() = false;
-                if let Some(tb) = self.get_editing_text_box_mut() {
-                    tb.selection_anchor = None;
-                    tb.scroll_y = 0.0;
-                }
-            }
             AppInput::ImportImage => {
-                if self.selected_item_id.is_some() {
+                if !self.selected_item_ids.is_empty() {
                     let dialog = gtk::FileDialog::new();
                     let filter = gtk::FileFilter::new();
                     filter.add_mime_type("image/*");
@@ -1069,17 +1391,17 @@ impl Component for AppModel {
                 if let Some(surface) = ImageBox::load_surface(&path) {
                     self.image_surfaces.insert(path.clone(), Rc::new(surface));
                 }
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Image(ib) = &mut item.content {
                             ib.image_path = Some(path);
                         }
                     }
                 }
-                self.popover_visible = false;
+                self.close_popover_and_skip_drag();
             }
             AppInput::FitFrameToImage => {
-                let id = self.selected_item_id.clone();
+                let id = self.selected_item_ids.first().cloned();
                 let item_data = id.as_ref().and_then(|id| self.find_item(id));
 
                 if let Some((_page_idx, item)) = item_data {
@@ -1102,20 +1424,10 @@ impl Component for AppModel {
                         }
                     }
                 }
-                self.popover_visible = false;
-            }
-            AppInput::FitImageToFrame => {
-                if let Some(id) = self.selected_item_id.clone() {
-                    if let Some((_, item)) = self.find_item_mut(&id) {
-                        if let ItemContent::Image(ib) = &mut item.content {
-                            ib.fit_mode = FitMode::ImageToFrame;
-                        }
-                    }
-                }
-                self.popover_visible = false;
+                self.close_popover_and_skip_drag();
             }
             AppInput::SetImageFitMode(mode) => {
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned() {
                     let mut aspect_ratio = None;
                     
                     // 1. Get aspect ratio if we are switching to Proportional
@@ -1145,7 +1457,7 @@ impl Component for AppModel {
                 }
             }
             AppInput::ImportSvg => {
-                if self.selected_item_id.is_some() {
+                if !self.selected_item_ids.is_empty() {
                     let dialog = gtk::FileDialog::new();
                     let filter = gtk::FileFilter::new();
                     filter.add_suffix("svg");
@@ -1172,7 +1484,7 @@ impl Component for AppModel {
                 match rsvg::Loader::new().read_path(&path) {
                     Ok(handle) => {
                         self.svg_handles.insert(path.clone(), Rc::new(handle));
-                        if let Some(id) = self.selected_item_id.clone() {
+                        if let Some(id) = self.selected_item_ids.first().cloned() {
                             if let Some((_, item)) = self.find_item_mut(&id) {
                                 if let ItemContent::Svg(sb) = &mut item.content {
                                     sb.svg_path = path;
@@ -1182,10 +1494,10 @@ impl Component for AppModel {
                     }
                     Err(e) => eprintln!("Failed to load SVG: {}", e),
                 }
-                self.popover_visible = false;
+                self.close_popover_and_skip_drag();
             }
             AppInput::SetSvgFitMode(mode) => {
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Svg(sb) = &mut item.content {
                             sb.fit_mode = mode;
@@ -1194,7 +1506,7 @@ impl Component for AppModel {
                 }
             }
             AppInput::FitFrameToSvg => {
-                let id = self.selected_item_id.clone();
+                let id = self.selected_item_ids.first().cloned();
                 let item_data = id.as_ref().and_then(|id| self.find_item(id));
 
                 if let Some((_page_idx, item)) = item_data {
@@ -1208,10 +1520,10 @@ impl Component for AppModel {
                         }
                     }
                 }
-                self.popover_visible = false;
+                self.close_popover_and_skip_drag();
             }
             AppInput::RefreshSvg => {
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned() {
                     if let Some((_, item)) = self.find_item(&id) {
                         if let ItemContent::Svg(sb) = &item.content {
                             let path = sb.svg_path.clone();
@@ -1226,7 +1538,7 @@ impl Component for AppModel {
                         }
                     }
                 }
-                self.popover_visible = false;
+                self.close_popover_and_skip_drag();
             }
             AppInput::ChooseSvgEditor => {
                 let dialog = gtk::FileDialog::new();
@@ -1245,7 +1557,7 @@ impl Component for AppModel {
                 self.svg_editor_path = Some(path);
             }
             AppInput::OpenExternalEditor => {
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned() {
                     if let Some((_, item)) = self.find_item(&id) {
                         if let ItemContent::Svg(sb) = &item.content {
                             let path = sb.svg_path.clone();
@@ -1263,10 +1575,10 @@ impl Component for AppModel {
                         }
                     }
                 }
-                self.popover_visible = false;
+                self.close_popover_and_skip_drag();
             }
             AppInput::BringToFront => {
-                if let Some(id) = self.selected_item_id.clone() {
+                for id in self.selected_item_ids.clone() {
                     for page in &mut self.document.pages {
                         if let Some(pos) = page.items.iter().position(|i| i.id == id) {
                             let item = page.items.remove(pos);
@@ -1277,7 +1589,7 @@ impl Component for AppModel {
                 }
             }
             AppInput::SendToBack => {
-                if let Some(id) = self.selected_item_id.clone() {
+                for id in self.selected_item_ids.clone().into_iter().rev() {
                     for page in &mut self.document.pages {
                         if let Some(pos) = page.items.iter().position(|i| i.id == id) {
                             let item = page.items.remove(pos);
@@ -1288,7 +1600,7 @@ impl Component for AppModel {
                 }
             }
             AppInput::BringForward => {
-                if let Some(id) = self.selected_item_id.clone() {
+                for id in self.selected_item_ids.clone().into_iter().rev() {
                     for page in &mut self.document.pages {
                         if let Some(pos) = page.items.iter().position(|i| i.id == id) {
                             if pos + 1 < page.items.len() {
@@ -1300,7 +1612,7 @@ impl Component for AppModel {
                 }
             }
             AppInput::SendBackward => {
-                if let Some(id) = self.selected_item_id.clone() {
+                for id in self.selected_item_ids.clone() {
                     for page in &mut self.document.pages {
                         if let Some(pos) = page.items.iter().position(|i| i.id == id) {
                             if pos > 0 {
@@ -1312,19 +1624,11 @@ impl Component for AppModel {
                 }
             }
             AppInput::DeleteItem => {
-                if let Some(id) = self.selected_item_id.clone() {
-                    let mut found = None;
-                    for (idx, page) in self.document.pages.iter().enumerate() {
-                        if page.items.iter().any(|i| i.id == id) {
-                            found = Some(idx);
-                            break;
-                        }
-                    }
-                    if let Some(page_idx) = found {
-                        if let Some(page) = self.document.pages.get_mut(page_idx) {
-                            page.items.retain(|item| item.id != id);
-                            self.selected_item_id = None;
-                        }
+                let to_delete: Vec<String> = self.selected_item_ids.clone();
+                self.selected_item_ids.clear();
+                for id in &to_delete {
+                    for page in &mut self.document.pages {
+                        page.items.retain(|item| &item.id != id);
                     }
                 }
             }
@@ -1334,7 +1638,7 @@ impl Component for AppModel {
                 if let Some(tb) = self.get_editing_text_box_mut() {
                     tb.insert_text(&text);
                 }
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned() {
                     if is_in_chain(&self.document, &id) {
                         self.reflow_version = self.reflow_version.wrapping_add(1);
                         let version = self.reflow_version;
@@ -1348,7 +1652,7 @@ impl Component for AppModel {
                         );
                     }
                 }
-                let item_dims = self.selected_item_id.as_ref()
+                let item_dims = self.selected_item_ids.first()
                     .and_then(|id| self.find_item(id))
                     .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
                 if let Some((w, h)) = item_dims {
@@ -1361,7 +1665,7 @@ impl Component for AppModel {
             }
             AppInput::TextKeyPressed(key, state) => {
                 if !self.is_editing {
-                    if key == gdk::Key::Delete && self.selected_item_id.is_some() {
+                    if (key == gdk::Key::Delete || key == gdk::Key::BackSpace) && !self.selected_item_ids.is_empty() {
                         sender.input(AppInput::DeleteItem);
                     }
                     return;
@@ -1417,7 +1721,7 @@ impl Component for AppModel {
                         sender.input(AppInput::CutText);
                     }
                     KeyAction::MoveVertical { up, extend } => {
-                        let frame_w_px = self.selected_item_id.as_ref()
+                        let frame_w_px = self.selected_item_ids.first()
                             .and_then(|id| self.find_item(id))
                             .map(|(_, item)| item.width * SCALE)
                             .unwrap_or(0.0);
@@ -1449,7 +1753,7 @@ impl Component for AppModel {
                     self.schedule_history_commit(&sender);
                 }
 
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned() {
                     if is_in_chain(&self.document, &id) {
                         self.reflow_version = self.reflow_version.wrapping_add(1);
                         let version = self.reflow_version;
@@ -1463,7 +1767,7 @@ impl Component for AppModel {
                         );
                     }
                 }
-                let item_dims = self.selected_item_id.as_ref()
+                let item_dims = self.selected_item_ids.first()
                     .and_then(|id| self.find_item(id))
                     .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
                 if let Some((w, h)) = item_dims {
@@ -1479,7 +1783,7 @@ impl Component for AppModel {
             }
             AppInput::ScrollText(dy) => {
                 if !self.is_editing { return; }
-                let item_dims = self.selected_item_id.as_ref()
+                let item_dims = self.selected_item_ids.first()
                     .and_then(|id| self.find_item(id))
                     .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
                 if let Some((w, h)) = item_dims {
@@ -1491,13 +1795,23 @@ impl Component for AppModel {
                     }
                 }
             }
-            AppInput::DragStart(x, y) => {
+            AppInput::DragStart(x, y, state) => {
+                if !self.canvas_ready { return; }
+                // Swallow the click that dismissed a popover so it doesn't
+                // accidentally move items or change current_page.
+                if self.pending_drag_start_swallows > 0 {
+                    self.pending_drag_start_swallows -= 1;
+                    return;
+                }
+                let is_ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
                 let x_mm = x / self.scale();
                 let y_mm = y / self.scale();
 
+                self.drag_offset = (0.0, 0.0);
+
                 // Check if the user clicked the link-out button on any text frame
-                if !self.is_editing {
-                    'link_check: for (page_idx, page) in self.document.pages.iter().enumerate() {
+                if !self.is_editing && !is_ctrl {
+                    for (page_idx, page) in self.document.pages.iter().enumerate() {
                         let (off_x, off_y) = self.get_page_offset(page_idx);
                         let local_x = x_mm - off_x;
                         let local_y = y_mm - off_y;
@@ -1512,7 +1826,7 @@ impl Component for AppModel {
                                 {
                                     self.link_drag_active = true;
                                     self.link_drag_source_id = Some(item.id.clone());
-                                    self.selected_item_id = Some(item.id.clone());
+                                    self.selected_item_ids = vec![item.id.clone()];
                                     let sc = self.scale();
                                     let sx = (off_x + item.x + item.width) * sc;
                                     let sy = (off_y + item.y + item.height) * sc;
@@ -1527,7 +1841,7 @@ impl Component for AppModel {
 
                 if self.is_editing {
                     if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
-                        if item.content.item_type() == ItemType::TextFrame && Some(item.id.clone()) == self.selected_item_id {
+                        if item.content.item_type() == ItemType::TextFrame && Some(item.id.clone()) == self.selected_item_ids.first().cloned() {
                             let (off_x, off_y) = self.get_page_offset(page_idx);
                             let local_x = x_mm - off_x;
                             let local_y = y_mm - off_y;
@@ -1556,8 +1870,8 @@ impl Component for AppModel {
                 self.drag_start = Some((x, y));
                 self.drag_current = Some((x, y));
 
-                let handle_hit = if let Some(selected_id) = &self.selected_item_id {
-                    if let Some((page_idx, item)) = self.find_item(selected_id) {
+                let handle_hit = if let Some(selected_id) = self.selected_item_ids.first().cloned() {
+                    if let Some((page_idx, item)) = self.find_item(&selected_id) {
                         let (off_x, off_y) = self.get_page_offset(page_idx);
                         let local_x = x_mm - off_x;
                         let local_y = y_mm - off_y;
@@ -1576,21 +1890,42 @@ impl Component for AppModel {
 
                 if let Some((idx, ix, iy, iw, ih, p_idx)) = handle_hit {
                     self.active_handle = Some(idx);
-                    self.initial_item_rect = Some((ix, iy, iw, ih));
+                    self.initial_item_rects.clear();
+                    self.initial_item_rects.insert(self.selected_item_ids[0].clone(), (ix, iy, iw, ih));
                     self.current_page = p_idx;
                     self.request_focus = true;
                     return;
                 }
 
                 if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
-                    self.selected_item_id = Some(item.id);
-                    self.initial_item_rect = Some((item.x, item.y, item.width, item.height));
-                    self.is_moving = true;
+                    if is_ctrl {
+                        if let Some(pos) = self.selected_item_ids.iter().position(|id| id == &item.id) {
+                            self.selected_item_ids.remove(pos);
+                            self.is_moving = false;
+                        } else {
+                            self.selected_item_ids.push(item.id.clone());
+                            self.is_moving = true;
+                        }
+                    } else {
+                        if !self.selected_item_ids.contains(&item.id) {
+                            self.selected_item_ids = vec![item.id.clone()];
+                        }
+                        self.is_moving = true;
+                    }
+                    
+                    self.initial_item_rects.clear();
+                    for id in &self.selected_item_ids {
+                        if let Some((_, it)) = self.find_item(id) {
+                            self.initial_item_rects.insert(id.clone(), (it.x, it.y, it.width, it.height));
+                        }
+                    }
                     self.current_page = page_idx;
                     self.request_focus = true;
                 } else {
-                    self.selected_item_id = None;
-                    self.initial_item_rect = None;
+                    if !is_ctrl {
+                        self.selected_item_ids.clear();
+                    }
+                    self.initial_item_rects.clear();
                     self.is_moving = false;
                     self.active_handle = None;
                     self.request_focus = true;
@@ -1609,167 +1944,17 @@ impl Component for AppModel {
                 }
             }
             AppInput::DragUpdate(offset_x, offset_y) => {
-                if self.link_drag_active {
-                    if let Some((sx, sy)) = self.link_drag_start {
-                        self.link_drag_current = Some((sx + offset_x, sy + offset_y));
-                    }
-                    return;
-                }
-                if self.text_drag_active {
-                    if let Some((sx, sy)) = self.drag_start {
-                        let x_mm = (sx + offset_x) / self.scale();
-                        let y_mm = (sy + offset_y) / self.scale();
-
-                        let hit_data = if let Some(id) = &self.selected_item_id {
-                            self.find_item(id).map(|(page_idx, item)| {
-                                let (off_x, off_y) = self.get_page_offset(page_idx);
-                                let local_x = x_mm - off_x;
-                                let local_y = y_mm - off_y;
-                                let pos = if let ItemContent::Text(ref tb) = item.content {
-                                    tb.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
-                                } else { 0 };
-                                (pos, item.width * SCALE, item.height * SCALE)
-                            })
-                        } else { None };
-
-                        if let Some((pos, w, h)) = hit_data {
-                            let pango_ctx = make_pango_ctx();
-                            if let Some(tb) = self.get_editing_text_box_mut() {
-                                tb.cursor_pos = pos;
-                                let s = tb.ensure_cursor_visible(&pango_ctx, w, h, SCALE);
-                                tb.scroll_y = s;
-                            }
-                        }
-                    }
-                    return;
-                }
-
-                if let Some((sx, sy)) = self.drag_start {
-                    self.drag_current = Some((sx + offset_x, sy + offset_y));
-                    let dx = offset_x / self.scale();
-                    let dy = offset_y / self.scale();
-                    
-                    let active_handle = self.active_handle;
-                    let is_moving = self.is_moving;
-
-                    if let (Some(id), Some((ix, iy, iw, ih))) = (self.selected_item_id.clone(), self.initial_item_rect) {
-                        let mut item_moved_to_new_page = None;
-                        let layout = self.page_layout;
-                        let doc_w = self.document.width;
-                        let doc_h = self.document.height;
-
-                        // Pre-calculate image ratio if needed to avoid borrow checker issues
-                        let image_ratio = if let Some((_, item)) = self.find_item(&id) {
-                            if let ItemContent::Image(ib) = &item.content {
-                                if ib.fit_mode == FitMode::FrameToImage {
-                                    ib.image_path.as_ref().and_then(|path| {
-                                        self.image_surfaces.get(path).map(|surf| surf.width() as f64 / surf.height() as f64)
-                                    })
-                                } else { None }
-                            } else { None }
-                        } else { None };
-                        
-                        // First find the item and update its position locally
-                        if let Some((page_idx, item)) = self.find_item_mut(&id) {
-                            if let Some(handle_idx) = active_handle {
-                                match handle_idx {
-                                    0 => { item.x = ix + dx; item.y = iy + dy; item.width = iw - dx; item.height = ih - dy; }
-                                    1 => { item.y = iy + dy; item.height = ih - dy; }
-                                    2 => { item.y = iy + dy; item.width = iw + dx; item.height = ih - dy; }
-                                    3 => { item.width = iw + dx; }
-                                    4 => { item.width = iw + dx; item.height = ih + dy; }
-                                    5 => { item.height = ih + dy; }
-                                    6 => { item.x = ix + dx; item.width = iw - dx; item.height = ih + dy; }
-                                    7 => { item.x = ix + dx; item.width = iw - dx; }
-                                    _ => {}
-                                }
-
-                                // Apply proportional constraint if in FrameToImage mode
-                                if let Some(ratio) = image_ratio {
-                                    match handle_idx {
-                                        3 | 7 | 4 | 6 => { // Width-driven or corners
-                                            item.height = item.width / ratio;
-                                            if handle_idx == 6 || handle_idx == 0 { // Bottom-Left or Top-Left
-                                                // y might need adjustment if we want to keep it centered or similar, 
-                                                // but for now simple width-based height adjustment.
-                                            }
-                                        }
-                                        1 | 5 => { // Height-driven
-                                            item.width = item.height * ratio;
-                                        }
-                                        0 | 2 => { // Top corners
-                                            item.width = item.height * ratio;
-                                            // Re-adjust X to maintain anchor if necessary
-                                        }
-                                        _ => {}
-                                    }
-                                }
-
-                                if item.width < 1.0 { item.width = 1.0; }
-                                if item.height < 1.0 { item.height = 1.0; }
-                            } else if is_moving {
-                                // Only move once the pointer has dragged more than 5 canvas pixels.
-                                // Prevents items from drifting on a click (which may fire drag_update
-                                // with tiny jitter, especially on first gesture after a document load).
-                                if offset_x * offset_x + offset_y * offset_y >= 25.0 {
-                                    item.x = ix + dx;
-                                    item.y = iy + dy;
-
-                                    // Check if item should move to another page
-                                    let page_gap = 20.0;
-                                    let (off_x, off_y) = match layout {
-                                        PageLayout::Vertical => (0.0, page_idx as f64 * (doc_h + page_gap)),
-                                        PageLayout::Horizontal => (page_idx as f64 * (doc_w + page_gap), 0.0),
-                                    };
-                                    let abs_x_mm = off_x + item.x + item.width / 2.0;
-                                    let abs_y_mm = off_y + item.y + item.height / 2.0;
-
-                                    let target_page_idx = match layout {
-                                        PageLayout::Vertical => (abs_y_mm / (doc_h + page_gap)).floor() as usize,
-                                        PageLayout::Horizontal => (abs_x_mm / (doc_w + page_gap)).floor() as usize,
-                                    };
-                                    let target_page_idx = target_page_idx.min(self.document.pages.len().saturating_sub(1));
-
-                                    if target_page_idx != page_idx {
-                                        item_moved_to_new_page = Some((page_idx, target_page_idx));
-                                    }
-                                }
-                            }
-                        }
-
-                        // If page change is needed, handle it here
-                        if let Some((old_idx, new_idx)) = item_moved_to_new_page {
-                            if let Some(old_page) = self.document.pages.get_mut(old_idx) {
-                                if let Some(pos) = old_page.items.iter().position(|i| i.id == id) {
-                                    let mut item = old_page.items.remove(pos);
-                                    
-                                    let (old_off_x, old_off_y) = self.get_page_offset(old_idx);
-                                    let (new_off_x, new_off_y) = self.get_page_offset(new_idx);
-
-                                    let abs_x = old_off_x + item.x;
-                                    let abs_y = old_off_y + item.y;
-                                    item.x = abs_x - new_off_x;
-                                    item.y = abs_y - new_off_y;
-                                    
-                                    if let Some(new_page) = self.document.pages.get_mut(new_idx) {
-                                        new_page.items.push(item);
-                                        self.current_page = new_idx;
-                                        if let Some((ix_ref, iy_ref, _, _)) = &mut self.initial_item_rect {
-                                            let abs_ix = old_off_x + *ix_ref;
-                                            let abs_iy = old_off_y + *iy_ref;
-                                            *ix_ref = abs_ix - new_off_x;
-                                            *iy_ref = abs_iy - new_off_y;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                self.drag_offset = (offset_x, offset_y);
+                self.process_drag();
+            }
+            AppInput::AdjustDragOffset(dx, dy) => {
+                self.drag_offset.0 += dx;
+                self.drag_offset.1 += dy;
+                self.process_drag();
             }
             AppInput::RightClick(x, y) => {
                 if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
-                    self.selected_item_id = Some(item.id.clone());
+                    self.selected_item_ids = vec![item.id.clone()];
                     self.current_page = page_idx;
                     self.popover_pos = (x, y);
                     self.popover_visible = true;
@@ -1782,7 +1967,7 @@ impl Component for AppModel {
                 let y_mm = y / self.scale();
 
                 // Check for double click on handles
-                if let Some(selected_id) = self.selected_item_id.clone() {
+                if let Some(selected_id) = self.selected_item_ids.first().cloned().clone() {
                     if let Some((page_idx, item)) = self.find_item(&selected_id) {
                         let (off_x, off_y) = self.get_page_offset(page_idx);
                         let local_x = x_mm - off_x;
@@ -1822,8 +2007,8 @@ impl Component for AppModel {
                     match item_type {
                         ItemType::TextFrame => {
                             let already_editing = self.is_editing
-                                && self.selected_item_id.as_deref() == Some(&id);
-                            self.selected_item_id = Some(id);
+                                && self.selected_item_ids.first().as_deref() == Some(&id);
+                            self.selected_item_ids = vec![id];
                             self.current_page = page_idx;
                             self.is_editing = true;
                             *self.editing_flag.borrow_mut() = true;
@@ -1841,12 +2026,12 @@ impl Component for AppModel {
                             }
                         }
                         ItemType::ImageFrame => {
-                            self.selected_item_id = Some(id);
+                            self.selected_item_ids = vec![id];
                             self.current_page = page_idx;
                             sender.input(AppInput::ImportImage);
                         }
                         ItemType::SvgFrame => {
-                            self.selected_item_id = Some(id);
+                            self.selected_item_ids = vec![id];
                             self.current_page = page_idx;
                             sender.input(AppInput::OpenExternalEditor);
                         }
@@ -1895,6 +2080,7 @@ impl Component for AppModel {
                                     id: new_id.clone(),
                                     x, y, width, height,
                                     rotation: 0.0,
+                                    show_border: true,
                                     content: match self.create_frame_type {
                                         ItemType::TextFrame => ItemContent::Text(TextBox::default()),
                                         ItemType::ImageFrame => ItemContent::Image(ImageBox::default()),
@@ -1902,164 +2088,84 @@ impl Component for AppModel {
                                         ItemType::Shape => ItemContent::Shape,
                                     },
                                 });
-                                self.selected_item_id = Some(new_id);
+                                self.selected_item_ids = vec![new_id];
                             }
                         }
                     }
                 }
                 self.drag_start = None;
                 self.drag_current = None;
-                self.initial_item_rect = None;
+                self.initial_item_rects.clear();
                 self.active_handle = None;
                 self.is_moving = false;
                 self.request_focus = true;
             }
             AppInput::SaveProject => {
-                let dialog = gtk::FileDialog::new();
-                let filter = gtk::FileFilter::new();
-                filter.add_pattern("*.rsp");
-                filter.set_name(Some("RScribus Project"));
-                let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
-                filters.append(&filter);
-                dialog.set_filters(Some(&filters));
-                dialog.set_default_filter(Some(&filter));
-
-                if let Some(path) = &self.last_save_path {
-                    let file = gtk::gio::File::for_path(path);
-                    dialog.set_initial_file(Some(&file));
-                }
-
-                let s = sender.clone();
-                let win = root.clone();
-                let doc = self.document.clone();
-                gtk::glib::MainContext::default().spawn_local(async move {
-                    if let Ok(file) = dialog.save_future(Some(&win)).await {
-                        if let Some(path) = file.path() {
-                            let mut path_str = path.to_string_lossy().to_string();
-                            if !path_str.ends_with(".rsp") {
-                                path_str.push_str(".rsp");
-                            }
-                            let save_path = std::path::Path::new(&path_str);
-                            if let Ok(_) = PersistenceManager::save_project(&doc, save_path) {
-                                s.input(AppInput::ProjectSaved(path_str));
-                            }
-                        }
-                    }
-                });
+                save_project_dialog(
+                    root,
+                    sender.clone(),
+                    self.document.clone(),
+                    self.last_save_path.as_deref(),
+                );
             }
             AppInput::ProjectSaved(path) => {
                 self.last_save_path = Some(path);
-                
-                let dialog = adw::MessageDialog::builder()
-                    .heading("Project Saved")
-                    .body("The project has been successfully saved.")
-                    .transient_for(root)
-                    .build();
-                dialog.add_response("ok", "OK");
-                dialog.present();
+
+                show_info_dialog(root, "Project Saved", "The project has been successfully saved.");
             }
             AppInput::OpenProject => {
-                let dialog = gtk::FileDialog::new();
-                let filter = gtk::FileFilter::new();
-                filter.add_pattern("*.rsp");
-                filter.set_name(Some("RScribus Project"));
-                let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
-                filters.append(&filter);
-                dialog.set_filters(Some(&filters));
-                dialog.set_default_filter(Some(&filter));
-
-                let s = sender.clone();
-                let win = root.clone();
-                gtk::glib::MainContext::default().spawn_local(async move {
-                    if let Ok(file) = dialog.open_future(Some(&win)).await {
-                        if let Some(path) = file.path() {
-                            let temp_dir = std::env::temp_dir().join("rscribus_extracted");
-                            if let Ok((doc, _)) = PersistenceManager::load_project(&path, &temp_dir) {
-                                s.input(AppInput::ProjectLoaded(doc, path.to_string_lossy().to_string()));
-                            }
-                        }
-                    }
-                });
+                open_project_dialog(root, sender.clone());
             }
             AppInput::ExportPdf => {
-                let dialog = gtk::FileDialog::new();
-                let filter = gtk::FileFilter::new();
-                filter.add_pattern("*.pdf");
-                filter.set_name(Some("PDF Document"));
-                let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
-                filters.append(&filter);
-                dialog.set_filters(Some(&filters));
-                dialog.set_default_filter(Some(&filter));
-
-                let s = sender.clone();
-                let win = root.clone();
-                let doc = self.document.clone();
-                let images = self.image_surfaces.clone();
-                let svgs = self.svg_handles.clone();
-                gtk::glib::MainContext::default().spawn_local(async move {
-                    if let Ok(file) = dialog.save_future(Some(&win)).await {
-                        if let Some(path) = file.path() {
-                            let mut path_str = path.to_string_lossy().to_string();
-                            if !path_str.ends_with(".pdf") {
-                                path_str.push_str(".pdf");
-                            }
-                            if let Ok(_) = export_to_pdf(&doc, &images, &svgs, &path_str) {
-                                let dialog = adw::MessageDialog::builder()
-                                    .heading("Export Successful")
-                                    .body("The document has been exported to PDF.")
-                                    .transient_for(&win)
-                                    .build();
-                                dialog.add_response("ok", "OK");
-                                dialog.present();
-                            }
-                        }
-                    }
-                });
+                export_pdf_dialog(
+                    root,
+                    self.document.clone(),
+                    self.image_surfaces.clone(),
+                    self.svg_handles.clone(),
+                );
             }
             AppInput::ProjectLoaded(doc, path) => {
                 self.document = doc;
                 self.last_save_path = Some(path);
-                self.selected_item_id = None;
+                self.selected_item_ids.clear();
                 self.is_editing = false;
+                *self.editing_flag.borrow_mut() = false;
+                
+                // Reset all interaction states to prevent jumps on first click
                 self.drag_start = None;
                 self.drag_current = None;
                 self.is_moving = false;
                 self.active_handle = None;
-                self.initial_item_rect = None;
+                self.initial_item_rects.clear();
                 self.text_drag_active = false;
                 self.link_drag_active = false;
                 self.link_drag_source_id = None;
                 self.link_drag_start = None;
                 self.link_drag_current = None;
+                self.popover_visible = false;
+                self.pending_drag_start_swallows = 0;
                 self.current_page = 0;
+                
+                // Reset internal counters
+                self.undo_version = 0;
+                self.reflow_version = 0;
+                self.typing_run_active = false;
 
-                // Pre-load all images from the loaded document
-                for page in &self.document.pages {
-                    for item in &page.items {
-                        if let ItemContent::Image(ib) = &item.content {
-                            if let Some(path) = &ib.image_path {
-                                if !self.image_surfaces.contains_key(path) {
-                                    if let Some(surface) = ImageBox::load_surface(path) {
-                                        self.image_surfaces.insert(path.clone(), Rc::new(surface));
-                                    }
-                                }
-                            }
-                        }
-                        if let ItemContent::Svg(sb) = &item.content {
-                            if !sb.svg_path.is_empty() && !self.svg_handles.contains_key(&sb.svg_path) {
-                                if let Ok(handle) = rsvg::Loader::new().read_path(&sb.svg_path) {
-                                    self.svg_handles.insert(sb.svg_path.clone(), Rc::new(handle));
-                                }
-                            }
-                        }
-                    }
-                }
+                self.load_all_assets();
+                self.rebuild_flow_providers();
+
+                // Block drag input until the canvas layout pass fires (size_allocate
+                // → CanvasReady).  This prevents the first click from jumping because
+                // GestureDrag would capture a stale widget origin.
+                self.canvas_ready = false;
+                self.swallow_upcoming_drag_start();
             }
             AppInput::SetBold(value) => {
+                if value == self.cursor_snapshot.bold { return; }
                 let editing = self.is_editing;
                 self.flush_history(); // push pre-format state, close typing run
                 let mut need_enter_edit = false;
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
@@ -2083,10 +2189,11 @@ impl Component for AppModel {
                 self.request_focus = true;
             }
             AppInput::SetItalic(value) => {
+                if value == self.cursor_snapshot.italic { return; }
                 let editing = self.is_editing;
                 self.flush_history(); // push pre-format state, close typing run
                 let mut need_enter_edit = false;
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
@@ -2110,10 +2217,11 @@ impl Component for AppModel {
                 self.request_focus = true;
             }
             AppInput::SetUnderline(value) => {
+                if value == self.cursor_snapshot.underline { return; }
                 let editing = self.is_editing;
                 self.flush_history(); // push pre-format state, close typing run
                 let mut need_enter_edit = false;
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
@@ -2139,7 +2247,7 @@ impl Component for AppModel {
             AppInput::SetFontFamily(family) => {
                 let editing = self.is_editing;
                 self.flush_history(); // push pre-format state, close typing run
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
@@ -2159,9 +2267,13 @@ impl Component for AppModel {
                 self.request_focus = true;
             }
             AppInput::SetFontSize(size) => {
+                // Guard against the #[watch] set_value → value-changed feedback loop:
+                // cursor_snapshot always reflects the effective size at the cursor, so a
+                // matching value means the spin was updated programmatically, not by the user.
+                if (size - self.cursor_snapshot.size_pt.unwrap_or(11.0)).abs() < 0.05 { return; }
                 let editing = self.is_editing;
                 self.flush_history(); // push pre-format state, close typing run
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
@@ -2186,7 +2298,7 @@ impl Component for AppModel {
             }
             AppInput::SetTextAlign(align) => {
                 self.flush_history(); // push pre-format state, close typing run
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             tb.set_alignment(align);
@@ -2202,7 +2314,7 @@ impl Component for AppModel {
             AppInput::ClearFormat => {
                 let editing = self.is_editing;
                 self.flush_history(); // push pre-format state, close typing run
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
@@ -2223,7 +2335,7 @@ impl Component for AppModel {
             }
             AppInput::MaybeReflow(version) => {
                 if version == self.reflow_version {
-                    if let Some(id) = self.selected_item_id.clone() {
+                    if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                         if is_in_chain(&self.document, &id) {
                             let sc = self.scale();
                             reflow_chain(&mut self.document, &id, sc);
@@ -2236,6 +2348,9 @@ impl Component for AppModel {
                     self.typing_run_active = false;
                 }
             }
+            AppInput::CanvasReady => {
+                self.canvas_ready = true;
+            }
             AppInput::CutText => {
                 if !self.is_editing { return; }
                 self.flush_history(); // push pre-cut state, close typing run
@@ -2243,7 +2358,7 @@ impl Component for AppModel {
                     tb.delete_selection();
                 }
                 // trigger reflow if in chain
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                     if is_in_chain(&self.document, &id) {
                         let sc = self.scale();
                         reflow_chain(&mut self.document, &id, sc);
@@ -2254,7 +2369,7 @@ impl Component for AppModel {
                 if !self.is_editing { return; }
                 self.typing_run_active = false;
                 self.undo_version = self.undo_version.wrapping_add(1);
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             tb.undo();
@@ -2270,7 +2385,7 @@ impl Component for AppModel {
                 if !self.is_editing { return; }
                 self.typing_run_active = false;
                 self.undo_version = self.undo_version.wrapping_add(1);
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             tb.redo();
@@ -2284,7 +2399,7 @@ impl Component for AppModel {
             }
             AppInput::LinkTo(target_id) => {
                 let source_id = self.link_drag_source_id.clone()
-                    .or_else(|| self.selected_item_id.clone());
+                    .or_else(|| self.selected_item_ids.first().cloned().clone());
 
                 if let Some(source_id) = source_id {
                     let target_already_chained = self.find_item(&target_id)
@@ -2312,7 +2427,7 @@ impl Component for AppModel {
                 }
             }
             AppInput::UnlinkFrame => {
-                if let Some(id) = self.selected_item_id.clone() {
+                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
                     let (next_id, prev_id) = self.find_item(&id)
                         .and_then(|(_, item)| {
                             if let ItemContent::Text(tb) = &item.content {
@@ -2344,8 +2459,165 @@ impl Component for AppModel {
                     }
                 }
             }
+            AppInput::SetWrapMode(mode) => {
+                if let Some(id) = self.selected_item_ids.first().cloned() {
+                    if let Some((_, item)) = self.find_item_mut(&id) {
+                        if let ItemContent::Image(ib) = &mut item.content {
+                            ib.wrap_mode = mode;
+                        }
+                    }
+                    self.rebuild_flow_providers();
+                }
+            }
+            AppInput::SetShowBorder(show) => {
+                let ids = self.selected_item_ids.clone();
+                for id in &ids {
+                    if let Some((_, item)) = self.find_item_mut(id) {
+                        item.show_border = show;
+                    }
+                }
+            }
+            AppInput::Autoscroll => {
+                self.autoscroll_timer = None;
+            }
         }
     }
+}
+
+// ── Text-flow provider management ────────────────────────────────────────────
+
+impl AppModel {
+    pub fn load_all_assets(&mut self) {
+        self.image_surfaces.clear();
+        self.svg_handles.clear();
+
+        for page in &self.document.pages {
+            for item in &page.items {
+                match &item.content {
+                    ItemContent::Image(ib) => {
+                        if let Some(ref path) = ib.image_path {
+                            if let Some(surface) = ImageBox::load_surface(path) {
+                                self.image_surfaces.insert(path.clone(), Rc::new(surface));
+                            }
+                        }
+                    }
+                    ItemContent::Svg(sb) => {
+                        if !sb.svg_path.is_empty() {
+                            if let Ok(handle) = rsvg::Loader::new().read_path(&sb.svg_path) {
+                                self.svg_handles.insert(sb.svg_path.clone(), Rc::new(handle));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Re-computes all flow providers for the current document.
+    /// Called after any image WrapMode change, move, or resize.
+    pub fn rebuild_flow_providers(&mut self) {
+        self.flow_providers.clear();
+        let scale = self.scale();
+        const FLOW_PADDING_PX: f64 = 3.0;
+
+        for page in &self.document.pages {
+            let wrap_images: Vec<&Item> = page.items.iter()
+                .filter(|it| matches!(&it.content, ItemContent::Image(ib) if ib.wrap_mode != WrapMode::Independent))
+                .collect();
+            if wrap_images.is_empty() { continue; }
+
+            for tf in page.items.iter().filter(|it| matches!(it.content, ItemContent::Text(_))) {
+                let fw_f = tf.width  * scale;
+                let fh_f = tf.height * scale;
+                let fw = fw_f as i32 + 1;
+                let fh = fh_f as i32 + 1;
+
+                // Collect images that overlap this text frame (with their frame-local coords).
+                let overlapping: Vec<(&Item, f64, f64, f64, f64)> = wrap_images.iter()
+                    .filter_map(|img| {
+                        let rel_x = (img.x - tf.x) * scale;
+                        let rel_y = (img.y - tf.y) * scale;
+                        let iw    = img.width  * scale;
+                        let ih    = img.height * scale;
+                        if rel_x < fw_f && rel_x + iw > 0.0 && rel_y < fh_f && rel_y + ih > 0.0 {
+                            Some((*img, rel_x, rel_y, iw, ih))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if overlapping.is_empty() { continue; }
+
+                // Build an A8 mask surface: 255 = text can go here, 0 = blocked.
+                // Start fully writable, then carve out each image using DestOut so
+                // the image's own alpha channel defines the obstacle shape.
+                let Ok(mut mask_surf) = cairo::ImageSurface::create(cairo::Format::A8, fw, fh)
+                else { continue };
+
+                {
+                    let Ok(cr) = cairo::Context::new(&mask_surf) else { continue };
+
+                    // Fill everything as writable (alpha = 1.0 → byte 255 in A8).
+                    cr.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+                    cr.paint().unwrap();
+
+                    // DestOut: dest_alpha *= (1 − src_alpha)
+                    // → opaque image pixel → mask becomes 0 (blocked)
+                    // → transparent image pixel → mask stays 255 (writable)
+                    cr.set_operator(cairo::Operator::DestOut);
+
+                    for (img, rel_x, rel_y, iw, ih) in &overlapping {
+                        let surf_opt = if let ItemContent::Image(ib) = &img.content {
+                            ib.image_path.as_deref().and_then(|p| self.image_surfaces.get(p))
+                        } else {
+                            None
+                        };
+
+                        cr.save().unwrap();
+                        cr.translate(*rel_x, *rel_y);
+
+                        if let Some(surf_rc) = surf_opt {
+                            let src_w = surf_rc.width()  as f64;
+                            let src_h = surf_rc.height() as f64;
+                            if src_w > 0.0 && src_h > 0.0 {
+                                cr.scale(iw / src_w, ih / src_h);
+                                cr.set_source_surface(&**surf_rc, 0.0, 0.0).unwrap();
+                                cr.paint().unwrap();
+                            }
+                        } else {
+                            // No surface loaded: fall back to opaque rectangle.
+                            cr.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+                            cr.rectangle(0.0, 0.0, *iw, *ih);
+                            cr.fill().unwrap();
+                        }
+                        cr.restore().unwrap();
+                    }
+                    // cr drops here, releasing Cairo's reference to mask_surf.
+                }
+
+                // Extract A8 bytes row-by-row (stride may be padded).
+                let stride   = mask_surf.stride() as usize;
+                let fw_usize = fw as usize;
+                let fh_usize = fh as usize;
+                let flat = {
+                    let Ok(data) = mask_surf.data() else { continue };
+                    let mut v = Vec::with_capacity(fw_usize * fh_usize);
+                    for row in 0..fh_usize {
+                        v.extend_from_slice(&data[row * stride..row * stride + fw_usize]);
+                    }
+                    v
+                };
+
+                let provider = PrecomputedFlowProvider::from_a8_mask(
+                    &flat, fw_usize, fh_usize, FLOW_PADDING_PX,
+                );
+                self.flow_providers.insert(tf.id.clone(), provider);
+            }
+        }
+    }
+
 }
 
 // ── Link-button geometry ──────────────────────────────────────────────────────
@@ -2561,107 +2833,132 @@ fn make_pango_ctx() -> gtk::pango::Context {
     ctx
 }
 
-fn is_selected_type(doc: &Document, selected_id: &Option<String>, ty: &ItemType) -> bool {
-    selected_id.as_ref()
-        .and_then(|id| {
-            for page in &doc.pages {
-                if let Some(item) = page.items.iter().find(|i| &i.id == id) {
-                    return Some(&item.content.item_type() == ty);
-                }
-            }
-            None
-        })
-        .unwrap_or(false)
+fn is_selected_type(doc: &Document, selected_ids: &[String], ty: &ItemType) -> bool {
+    if selected_ids.len() != 1 { return false; }
+    let id = &selected_ids[0];
+    for page in &doc.pages {
+        if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+            return &item.content.item_type() == ty;
+        }
+    }
+    false
 }
 
-fn selected_image_frame_has_image(doc: &Document, selected_id: &Option<String>) -> bool {
-    selected_id.as_ref()
-        .and_then(|id| {
-            for page in &doc.pages {
-                if let Some(item) = page.items.iter().find(|i| &i.id == id) {
-                    return Some(matches!(&item.content, ItemContent::Image(ib) if ib.image_path.is_some()));
-                }
-            }
-            None
-        })
-        .unwrap_or(false)
+fn selected_image_frame_has_image(doc: &Document, selected_ids: &[String]) -> bool {
+    if selected_ids.len() != 1 { return false; }
+    let id = &selected_ids[0];
+    for page in &doc.pages {
+        if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+            return matches!(&item.content, ItemContent::Image(ib) if ib.image_path.is_some());
+        }
+    }
+    false
 }
 
-fn get_selected_fit_mode(doc: &Document, selected_id: &Option<String>) -> Option<crate::image_box::FitMode> {
-    selected_id.as_ref().and_then(|id| {
-        for page in &doc.pages {
-            if let Some(item) = page.items.iter().find(|i| &i.id == id) {
-                if let ItemContent::Image(ib) = &item.content {
-                    return Some(ib.fit_mode);
-                }
-                return None;
+fn get_selected_fit_mode(doc: &Document, selected_ids: &[String]) -> Option<crate::image_box::FitMode> {
+    if selected_ids.len() != 1 { return None; }
+    let id = &selected_ids[0];
+    for page in &doc.pages {
+        if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+            if let ItemContent::Image(ib) = &item.content {
+                return Some(ib.fit_mode);
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn get_selected_wrap_mode(doc: &Document, selected_ids: &[String]) -> Option<WrapMode> {
+    if selected_ids.len() != 1 { return None; }
+    let id = &selected_ids[0];
+    for page in &doc.pages {
+        if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+            if let ItemContent::Image(ib) = &item.content {
+                return Some(ib.wrap_mode);
             }
         }
-        None
-    })
+    }
+    None
 }
 
-fn get_selected_svg_fit_mode(doc: &Document, selected_id: &Option<String>) -> Option<crate::svg_box::FitMode> {
-    selected_id.as_ref().and_then(|id| {
-        for page in &doc.pages {
-            if let Some(item) = page.items.iter().find(|i| &i.id == id) {
-                if let ItemContent::Svg(sb) = &item.content {
-                    return Some(sb.fit_mode);
-                }
-                return None;
+fn get_selected_svg_fit_mode(doc: &Document, selected_ids: &[String]) -> Option<crate::svg_box::FitMode> {
+    if selected_ids.len() != 1 { return None; }
+    let id = &selected_ids[0];
+    for page in &doc.pages {
+        if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+            if let ItemContent::Svg(sb) = &item.content {
+                return Some(sb.fit_mode);
+            }
+            return None;
+        }
+    }
+    None
+}
+
+fn get_svg_path_info(doc: &Document, selected_ids: &[String]) -> String {
+    if selected_ids.len() != 1 { return String::new(); }
+    let id = &selected_ids[0];
+    for page in &doc.pages {
+        if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+            if let ItemContent::Svg(sb) = &item.content {
+                return format!("Current path: {}", sb.svg_path);
             }
         }
-        None
-    })
+    }
+    String::new()
 }
 
-fn get_svg_path_info(doc: &Document, selected_id: &Option<String>) -> String {
-    selected_id.as_ref().and_then(|id| {
-        for page in &doc.pages {
-            if let Some(item) = page.items.iter().find(|i| &i.id == id) {
-                if let ItemContent::Svg(sb) = &item.content {
-                    return Some(format!("Current path: {}", sb.svg_path));
-                }
-            }
+fn get_selected_show_border(doc: &Document, selected_ids: &[String]) -> bool {
+    if selected_ids.is_empty() { return false; }
+    let id = &selected_ids[0];
+    for page in &doc.pages {
+        if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+            return item.show_border;
         }
-        None
-    }).unwrap_or_default()
+    }
+    false
 }
 
-fn get_info_text(doc: &Document, selected_id: &Option<String>) -> String {
-    if let Some(id) = selected_id {
-        for page in &doc.pages {
-            if let Some(item) = page.items.iter().find(|i| &i.id == id) {
-                return match &item.content {
-                    ItemContent::Text(tb) => {
-                        let text = &tb.text;
-                        let paragraphs = text.split('\n').filter(|s| !s.is_empty()).count();
-                        let words = text.split_whitespace().count();
-                        let characters = text.len();
-                        let lines = text.lines().count();
-                        format!(
-                            "Type: Text Frame\nSize: {:.1}x{:.1}mm\nParagraphs: {}\nLines: {}\nWords: {}\nCharacters: {}",
-                            item.width, item.height, paragraphs, lines, words, characters
-                        )
-                    }
-                    ItemContent::Image(ib) => {
-                        let image_info = ib.image_path.as_ref()
-                            .and_then(|p| std::path::Path::new(p).file_name())
-                            .map(|n| format!("\nFile: {}", n.to_string_lossy()))
-                            .unwrap_or_else(|| "\nNo image loaded".to_string());
-                        format!("Type: Image Frame\nSize: {:.1}x{:.1}mm{}", item.width, item.height, image_info)
-                    }
-                    ItemContent::Svg(sb) => {
-                        let svg_info = if sb.svg_path.is_empty() {
-                            "\nNo SVG loaded".to_string()
-                        } else {
-                            format!("\nFile: {}", std::path::Path::new(&sb.svg_path).file_name().unwrap_or_default().to_string_lossy())
-                        };
-                        format!("Type: SVG Frame\nSize: {:.1}x{:.1}mm{}", item.width, item.height, svg_info)
-                    }
-                    ItemContent::Shape => format!("Type: Shape\nSize: {:.1}x{:.1}mm", item.width, item.height),
-                };
-            }
+fn get_info_text(doc: &Document, selected_ids: &[String]) -> String {
+    if selected_ids.is_empty() {
+        return "No item selected".to_string();
+    }
+    if selected_ids.len() > 1 {
+        return format!("{} items selected", selected_ids.len());
+    }
+    let id = &selected_ids[0];
+    for page in &doc.pages {
+        if let Some(item) = page.items.iter().find(|i| &i.id == id) {
+            return match &item.content {
+                ItemContent::Text(tb) => {
+                    let text = &tb.text;
+                    let paragraphs = text.split('\n').filter(|s| !s.is_empty()).count();
+                    let words = text.split_whitespace().count();
+                    let characters = text.len();
+                    let lines = text.lines().count();
+                    format!(
+                        "Type: Text Frame\nSize: {:.1}x{:.1}mm\nParagraphs: {}\nLines: {}\nWords: {}\nCharacters: {}",
+                        item.width, item.height, paragraphs, lines, words, characters
+                    )
+                }
+                ItemContent::Image(ib) => {
+                    let image_info = ib.image_path.as_ref()
+                        .and_then(|p| std::path::Path::new(p).file_name())
+                        .map(|n| format!("\nFile: {}", n.to_string_lossy()))
+                        .unwrap_or_else(|| "\nNo image loaded".to_string());
+                    format!("Type: Image Frame\nSize: {:.1}x{:.1}mm{}", item.width, item.height, image_info)
+                }
+                ItemContent::Svg(sb) => {
+                    let svg_info = if sb.svg_path.is_empty() {
+                        "\nNo SVG loaded".to_string()
+                    } else {
+                        format!("\nFile: {}", std::path::Path::new(&sb.svg_path).file_name().unwrap_or_default().to_string_lossy())
+                    };
+                    format!("Type: SVG Frame\nSize: {:.1}x{:.1}mm{}", item.width, item.height, svg_info)
+                }
+                ItemContent::Shape => format!("Type: Shape\nSize: {:.1}x{:.1}mm", item.width, item.height),
+            };
         }
     }
     "No item selected".to_string()
@@ -2688,15 +2985,16 @@ fn draw_page_content(
     page: &crate::document::Page,
     images: &HashMap<String, Rc<cairo::ImageSurface>>,
     svg_handles: &HashMap<String, Rc<rsvg::SvgHandle>>,
-    selected_id: Option<&String>,
+    selected_ids: &[String],
     is_editing: bool,
     draw_handles: bool,
     scale_factor: f64,
     chain_ids: &[String],
+    flow_providers: &HashMap<String, PrecomputedFlowProvider>,
 ) {
     for item in &page.items {
-        let is_selected = selected_id == Some(&item.id);
-        let is_editing_this = is_selected && is_editing;
+        let is_selected = selected_ids.contains(&item.id);
+        let is_editing_this = is_selected && is_editing && selected_ids.first() == Some(&item.id);
 
         cr.save().unwrap();
         cr.translate(item.x * scale_factor, item.y * scale_factor);
@@ -2706,13 +3004,14 @@ fn draw_page_content(
         let h = item.height * scale_factor;
         match &item.content {
             ItemContent::Text(tb) => {
-                tb.render(cr, pango_ctx, w, h, is_selected, is_editing_this, scale_factor);
+                let flow = flow_providers.get(&item.id).map(|p| p as &dyn crate::text_flow::TextFlowProvider);
+                tb.render(cr, pango_ctx, w, h, is_selected, is_editing_this, item.show_border, scale_factor, flow);
             }
             ItemContent::Image(ib) => {
                 let image = ib.image_path.as_ref()
                     .and_then(|p| images.get(p))
                     .map(|rc| rc.as_ref());
-                ib.render(cr, w, h, is_selected, image);
+                ib.render(cr, w, h, is_selected, item.show_border, image);
             }
             ItemContent::Svg(sb) => {
                 let handle = if sb.svg_path.is_empty() {
@@ -2720,9 +3019,21 @@ fn draw_page_content(
                 } else {
                     svg_handles.get(&sb.svg_path).map(|rc| rc.as_ref())
                 };
-                sb.render(cr, w, h, is_selected, handle);
+                sb.render(cr, w, h, is_selected, item.show_border, handle);
             }
-            ItemContent::Shape => {}
+            ItemContent::Shape => {
+                if is_selected || item.show_border {
+                    if is_selected {
+                        cr.set_source_rgb(0.0, 0.5, 1.0);
+                        cr.set_line_width(2.0);
+                    } else {
+                        cr.set_source_rgb(0.3, 0.3, 0.3);
+                        cr.set_line_width(1.0);
+                    }
+                    cr.rectangle(0.0, 0.0, w, h);
+                    cr.stroke().unwrap();
+                }
+            }
         }
 
         cr.restore().unwrap();
@@ -2743,7 +3054,7 @@ fn draw_page_content(
         }
 
         // Chain sibling highlight: dashed border on every non-selected member of the chain
-        if !chain_ids.is_empty() && selected_id != Some(&item.id)
+        if !chain_ids.is_empty() && !selected_ids.contains(&item.id)
             && chain_ids.iter().any(|cid| *cid == item.id)
         {
             let w = item.width  * scale_factor;
@@ -2832,13 +3143,14 @@ fn draw_canvas(
     doc: &Document,
     drag_start: Option<(f64, f64)>,
     drag_current: Option<(f64, f64)>,
-    selected_id: Option<String>,
+    selected_ids: &[String],
     is_editing: bool,
     images: &HashMap<String, Rc<cairo::ImageSurface>>,
     svg_handles: &HashMap<String, Rc<rsvg::SvgHandle>>,
     zoom: f64,
     layout: PageLayout,
     link_drag: Option<((f64, f64), (f64, f64))>,
+    flow_providers: &HashMap<String, PrecomputedFlowProvider>,
 ) {
     cr.save().unwrap();
     cr.scale(zoom, zoom);
@@ -2849,7 +3161,7 @@ fn draw_canvas(
     pangocairo::functions::context_set_resolution(&pango_ctx, 25.4 * SCALE);
 
     // Collect chain siblings of the selected frame so they can be highlighted
-    let chain_ids: Vec<String> = selected_id.as_ref()
+    let chain_ids: Vec<String> = selected_ids.first()
         .filter(|id| is_in_chain(doc, id))
         .map(|id| {
             let root = find_chain_root(doc, id);
@@ -2888,13 +3200,13 @@ fn draw_canvas(
         cr.stroke().unwrap();
         cr.set_dash(&[], 0.0);
 
-        draw_page_content(cr, &pango_ctx, page, images, svg_handles, selected_id.as_ref(), is_editing, true, SCALE, &chain_ids);
+        draw_page_content(cr, &pango_ctx, page, images, svg_handles, selected_ids, is_editing, true, SCALE, &chain_ids, flow_providers);
 
         cr.restore().unwrap();
     }
     cr.restore().unwrap();
 
-    if drag_start.is_some() && selected_id.is_none() {
+    if drag_start.is_some() && selected_ids.is_empty() {
         if let (Some((sx, sy)), Some((cx, cy))) = (drag_start, drag_current) {
             cr.set_source_rgba(0.0, 0.5, 1.0, 0.3);
             cr.rectangle(sx.min(cx), sy.min(cy), (sx - cx).abs(), (sy - cy).abs());
@@ -2961,7 +3273,7 @@ pub fn export_to_pdf(
         let pdf_scale = mm_to_points / SCALE;
         cr.scale(pdf_scale, pdf_scale);
 
-        draw_page_content(&cr, &pango_ctx, page, images, svg_handles, None, false, false, SCALE, &[]);
+        draw_page_content(&cr, &pango_ctx, page, images, svg_handles, &[], false, false, SCALE, &[], &HashMap::new());
 
         cr.restore()?;
         cr.show_page()?;
@@ -2970,4 +3282,3 @@ pub fn export_to_pdf(
     surface.finish();
     Ok(())
 }
-

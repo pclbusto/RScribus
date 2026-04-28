@@ -2,6 +2,7 @@ use gtk4::gdk;
 use gtk4::pango;
 use gtk4::prelude::DisplayExt;
 use serde::{Deserialize, Serialize};
+use crate::text_flow::TextFlowProvider;
 
 const DEFAULT_FONT: &str = "Sans 11";
 const DEFAULT_PADDING: f64 = 4.0 / 3.0;
@@ -248,9 +249,6 @@ impl TextBox {
     pub fn set_alignment(&mut self, align: TextAlign) { self.alignment = align; }
     pub fn get_alignment(&self) -> TextAlign { self.alignment }
 
-    pub fn set_line_spacing(&mut self, factor: f64) { self.line_spacing = factor; }
-    pub fn get_line_spacing(&self) -> f64 { self.line_spacing }
-
     /// Selection range if active, otherwise the word boundaries around the cursor.
     pub fn selection_or_word_range(&self) -> (usize, usize) {
         if let Some(range) = self.selection_range() {
@@ -308,51 +306,6 @@ impl TextBox {
         snap
     }
 
-    /// Generates an HTML fragment representing the text with inline formatting tags.
-    pub fn to_html(&self) -> String {
-        if self.text.is_empty() { return String::new(); }
-        let mut boundaries: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-        boundaries.insert(0);
-        boundaries.insert(self.text.len());
-        for attr in &self.attributes {
-            let s = (attr.start as usize).min(self.text.len());
-            let e = (attr.end as usize).min(self.text.len());
-            if self.text.is_char_boundary(s) { boundaries.insert(s); }
-            if self.text.is_char_boundary(e) { boundaries.insert(e); }
-        }
-        let boundaries: Vec<usize> = boundaries.into_iter().collect();
-        let mut html = String::new();
-        for w in boundaries.windows(2) {
-            let (seg_s, seg_e) = (w[0], w[1]);
-            if seg_s >= self.text.len() { break; }
-            let snap = self.get_attr_at(seg_s);
-            if snap.bold      { html.push_str("<b>"); }
-            if snap.italic    { html.push_str("<i>"); }
-            if snap.underline { html.push_str("<u>"); }
-            let has_span = snap.size_pt.is_some() || snap.color.is_some() || snap.family.is_some();
-            if has_span {
-                html.push_str("<span style=\"");
-                if let Some(f) = &snap.family { html.push_str(&format!("font-family:{};", f)); }
-                if let Some(pt) = snap.size_pt { html.push_str(&format!("font-size:{:.1}pt;", pt)); }
-                if let Some([r, g, b]) = snap.color { html.push_str(&format!("color:#{:02x}{:02x}{:02x};", r, g, b)); }
-                html.push_str("\">");
-            }
-            for ch in self.text[seg_s..seg_e].chars() {
-                match ch {
-                    '<'  => html.push_str("&lt;"),
-                    '>'  => html.push_str("&gt;"),
-                    '&'  => html.push_str("&amp;"),
-                    '\n' => html.push_str("<br>"),
-                    c    => html.push(c),
-                }
-            }
-            if has_span       { html.push_str("</span>"); }
-            if snap.underline { html.push_str("</u>"); }
-            if snap.italic    { html.push_str("</i>"); }
-            if snap.bold      { html.push_str("</b>"); }
-        }
-        html
-    }
 }
 
 // ── Undo / Redo ───────────────────────────────────────────────────────────────
@@ -529,10 +482,6 @@ impl TextBox {
         }
     }
 
-    pub fn cut_selection(&mut self) {
-        self.copy_selection();
-        self.delete_selection();
-    }
 }
 
 // ── Cursor movement ───────────────────────────────────────────────────────────
@@ -589,7 +538,6 @@ impl TextBox {
         pangocairo::functions::context_set_resolution(&ctx, 25.4 * scale);
         let padding = self.padding * scale;
         let layout = self.prepare_layout(&ctx, frame_w_px, padding);
-        let pscale = pango::SCALE as f64;
 
         let byte_idx = self.cursor_pos.min(self.text.len()) as i32;
         let (strong, _) = layout.cursor_pos(byte_idx);
@@ -764,6 +712,9 @@ impl TextBox {
     }
 
     /// Renders the text box into `cr` (translated to item origin).
+    /// When `flow` is provided the text is laid out around the obstacles
+    /// described by the provider; otherwise the standard single-column
+    /// layout is used.
     pub fn render(
         &self,
         cr: &cairo::Context,
@@ -772,7 +723,9 @@ impl TextBox {
         h: f64,
         is_selected: bool,
         is_editing: bool,
+        show_border: bool,
         scale_factor: f64,
+        flow: Option<&dyn TextFlowProvider>,
     ) {
         let padding = self.padding * scale_factor;
 
@@ -782,15 +735,23 @@ impl TextBox {
             cr.fill().unwrap();
         }
 
-        if is_selected {
-            cr.set_source_rgb(0.0, 0.5, 1.0);
-            cr.set_line_width(2.0);
-        } else {
-            cr.set_source_rgb(0.3, 0.3, 0.3);
-            cr.set_line_width(1.0);
+        if is_selected || show_border {
+            if is_selected {
+                cr.set_source_rgb(0.0, 0.5, 1.0);
+                cr.set_line_width(2.0);
+            } else {
+                cr.set_source_rgb(0.3, 0.3, 0.3);
+                cr.set_line_width(1.0);
+            }
+            cr.rectangle(0.0, 0.0, w, h);
+            cr.stroke().unwrap();
         }
-        cr.rectangle(0.0, 0.0, w, h);
-        cr.stroke().unwrap();
+
+        // Flow rendering (obstacles present, not editing)
+        if let Some(provider) = flow.filter(|_| !is_editing) {
+            self.render_with_provider(cr, pango_ctx, w, h, scale_factor, provider);
+            return;
+        }
 
         cr.save().unwrap();
         cr.rectangle(1.0, 1.0, w - 2.0, h - 2.0);
@@ -845,6 +806,124 @@ impl TextBox {
                 draw_overflow_indicator(cr, w, h);
             }
         }
+    }
+
+    /// Flows text through the intervals supplied by `provider`, line by line.
+    fn render_with_provider(
+        &self,
+        cr: &cairo::Context,
+        pango_ctx: &pango::Context,
+        w: f64,
+        h: f64,
+        sf: f64,
+        provider: &dyn TextFlowProvider,
+    ) {
+        let padding = self.padding * sf;
+        let pscale  = pango::SCALE as f64;
+        let fd      = pango::FontDescription::from_string(&self.font_description);
+
+        // Compute ascent and line height from font metrics.
+        // show_layout_line draws with the BASELINE at the current point, so we
+        // must offset by `ascent` to align the top of the text with `y`.
+        let (ascent, line_h) = {
+            let tmp = pango::Layout::new(pango_ctx);
+            tmp.set_font_description(Some(&fd));
+            tmp.set_text("Hg");
+            // line(0) extents: logical.y() is negative (top is above baseline)
+            let (ascent_pu, descent_pu) = if let Some(ln) = tmp.line(0) {
+                let (_, log) = ln.extents();
+                let a = (-log.y())         .max(0);
+                let d = (log.height() + log.y()).max(0);
+                (a, d)
+            } else {
+                let (_, ph) = tmp.size();
+                (ph * 3 / 4, ph / 4)
+            };
+            let a = ascent_pu  as f64 / pscale;
+            let d = descent_pu as f64 / pscale;
+            (a, ((a + d) * self.line_spacing).max(1.0))
+        };
+
+        cr.save().unwrap();
+        cr.rectangle(1.0, 1.0, w - 2.0, h - 2.0);
+        cr.clip();
+        cr.set_source_rgb(0.1, 0.1, 0.1);
+
+        let mut text_pos = 0usize;
+        let mut y = padding;  // y = top of the current line slot
+
+        while y + line_h <= h + 0.5 && text_pos < self.text.len() {
+            let intervals = provider.intervals_for_line(y, line_h);
+            let mut consumed_this_row = false;
+
+            for iv in intervals {
+                if text_pos >= self.text.len() { break; }
+
+                // Shrink interval by the text-frame padding on both sides.
+                let ix = iv.x + padding;
+                let iw = iv.width - 2.0 * padding;
+                if iw < 4.0 { continue; }
+
+                // Build a layout for the remaining text at this interval's width.
+                let layout = pango::Layout::new(pango_ctx);
+                layout.set_text(&self.text[text_pos..]);
+                layout.set_font_description(Some(&fd));
+                layout.set_width((iw * pscale) as i32);
+                layout.set_wrap(pango::WrapMode::Word);
+                layout.set_alignment(match self.alignment {
+                    TextAlign::Left   => pango::Alignment::Left,
+                    TextAlign::Center => pango::Alignment::Center,
+                    TextAlign::Right  => pango::Alignment::Right,
+                });
+                if self.line_spacing != 1.0 {
+                    layout.set_line_spacing(self.line_spacing as f32);
+                }
+                if !self.attributes.is_empty() {
+                    layout.set_attributes(Some(&build_attr_list_slice(
+                        &self.attributes, text_pos, self.text.len(),
+                    )));
+                }
+
+                // Take only the first line that Pango calculated.
+                let Some(line0) = layout.line(0) else { continue };
+                // Use line(1).start_index() as the byte count — this reliably
+                // includes the paragraph separator (\n) that line0.length() may omit.
+                let bytes_used = match layout.line(1) {
+                    Some(line1) => line1.start_index() as usize,
+                    None        => self.text[text_pos..].len(),
+                }.min(self.text[text_pos..].len());
+
+                if bytes_used == 0 {
+                    // Stuck on a bare paragraph separator — consume it directly.
+                    if self.text[text_pos..].starts_with('\n') {
+                        text_pos += 1;
+                    }
+                    continue;
+                }
+
+                // show_layout_line renders at the baseline → offset y by ascent.
+                cr.move_to(ix, y + ascent);
+                pangocairo::functions::show_layout_line(cr, &line0);
+
+                let new_pos = text_pos + bytes_used;
+                // Round down to a valid UTF-8 boundary.
+                let new_pos = {
+                    let mut p = new_pos.min(self.text.len());
+                    while p > text_pos && !self.text.is_char_boundary(p) { p -= 1; }
+                    p
+                };
+                if new_pos > text_pos {
+                    text_pos = new_pos;
+                    consumed_this_row = true;
+                }
+            }
+
+            // Always advance Y so we never loop forever.
+            let _ = consumed_this_row;
+            y += line_h;
+        }
+
+        cr.restore().unwrap();
     }
 
     /// Maps a click position (mm) to a byte index in the text.
@@ -958,4 +1037,106 @@ fn next_char_boundary(s: &str, pos: usize) -> usize {
     let mut i = pos + 1;
     while i < s.len() && !s.is_char_boundary(i) { i += 1; }
     i.min(s.len())
+}
+
+/// Build a Pango attribute list for the byte slice `[start, end)` of `attrs`,
+/// remapping all indices so they are relative to `start`.
+pub(crate) fn build_attr_list_slice(
+    attrs: &[TextAttribute],
+    start: usize,
+    end: usize,
+) -> pango::AttrList {
+    let list = pango::AttrList::new();
+    let s = start as u32;
+    let e = end as u32;
+    for attr in attrs {
+        if attr.end <= s || attr.start >= e { continue; }
+        let adj_start = attr.start.max(s) - s;
+        let adj_end   = attr.end.min(e)   - s;
+        if adj_end <= adj_start { continue; }
+        let mut pa: pango::Attribute = match &attr.value {
+            AttrValue::Family(f) => pango::AttrString::new_family(f).into(),
+            AttrValue::Size(pt)  => pango::AttrSize::new((*pt * pango::SCALE as f64) as i32).into(),
+            AttrValue::Bold(b)   => pango::AttrInt::new_weight(
+                if *b { pango::Weight::Bold } else { pango::Weight::Normal }).into(),
+            AttrValue::Italic(b) => pango::AttrInt::new_style(
+                if *b { pango::Style::Italic } else { pango::Style::Normal }).into(),
+            AttrValue::Underline(b) => pango::AttrInt::new_underline(
+                if *b { pango::Underline::Single } else { pango::Underline::None }).into(),
+            AttrValue::Color([r, g, b]) => {
+                let x = |v: u8| v as u16 * 257;
+                pango::AttrColor::new_foreground(x(*r), x(*g), x(*b)).into()
+            }
+            AttrValue::BgColor([r, g, b]) => {
+                let x = |v: u8| v as u16 * 257;
+                pango::AttrColor::new_background(x(*r), x(*g), x(*b)).into()
+            }
+        };
+        pa.set_start_index(adj_start);
+        pa.set_end_index(adj_end);
+        list.insert(pa);
+    }
+    list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttrValue, TextAlign, TextBox};
+
+    #[test]
+    fn apply_format_replaces_overlapping_spans_of_same_kind() {
+        let mut tb = TextBox::new("hello world".to_string());
+        tb.apply_format(0, 5, AttrValue::Bold(true));
+        tb.apply_format(3, 8, AttrValue::Bold(false));
+
+        assert_eq!(tb.attributes.len(), 2);
+        assert!(matches!(tb.attributes[0].value, AttrValue::Bold(true)));
+        assert_eq!((tb.attributes[0].start, tb.attributes[0].end), (0, 3));
+        assert!(matches!(tb.attributes[1].value, AttrValue::Bold(false)));
+        assert_eq!((tb.attributes[1].start, tb.attributes[1].end), (3, 8));
+    }
+
+    #[test]
+    fn clear_format_splits_overlapping_ranges() {
+        let mut tb = TextBox::new("hello world".to_string());
+        tb.apply_format(0, tb.text.len(), AttrValue::Underline(true));
+        tb.clear_format(2, 8);
+
+        assert_eq!(tb.attributes.len(), 2);
+        assert_eq!((tb.attributes[0].start, tb.attributes[0].end), (0, 2));
+        assert_eq!((tb.attributes[1].start, tb.attributes[1].end), (8, tb.text.len() as u32));
+    }
+
+    #[test]
+    fn effective_snapshot_falls_back_to_base_font_description() {
+        let mut tb = TextBox::new("hello".to_string());
+        tb.font_description = "Serif Bold Italic 14".to_string();
+        let snap = tb.effective_snapshot_at(0);
+
+        assert_eq!(snap.family.as_deref(), Some("Serif"));
+        assert_eq!(snap.size_pt, Some(14.0));
+        assert!(snap.bold);
+        assert!(snap.italic);
+    }
+
+    #[test]
+    fn undo_and_redo_restore_text_attributes_and_alignment() {
+        let mut tb = TextBox::new("hello".to_string());
+        tb.alignment = TextAlign::Left;
+        tb.cursor_pos = tb.text.len();
+        tb.push_history();
+        tb.insert_text(" world");
+        tb.apply_format(0, 5, AttrValue::Bold(true));
+        tb.alignment = TextAlign::Center;
+
+        assert!(tb.undo());
+        assert_eq!(tb.text, "hello");
+        assert!(tb.attributes.is_empty());
+        assert_eq!(tb.alignment, TextAlign::Left);
+
+        assert!(tb.redo());
+        assert_eq!(tb.text, "hello world");
+        assert_eq!(tb.alignment, TextAlign::Center);
+        assert_eq!(tb.attributes.len(), 1);
+    }
 }

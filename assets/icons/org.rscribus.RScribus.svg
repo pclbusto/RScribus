@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title desc">
+  <title id="title">RScribus application icon</title>
+  <desc id="desc">A paper sheet with a folded corner and the RS monogram.</desc>
+  <defs>
+    <linearGradient id="bg" x1="24" y1="20" x2="232" y2="236" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#10334a"/>
+      <stop offset="1" stop-color="#1c7f86"/>
+    </linearGradient>
+    <linearGradient id="page" x1="58" y1="44" x2="194" y2="212" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#dce8ee"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="76" y1="98" x2="180" y2="178" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#d46a2f"/>
+      <stop offset="1" stop-color="#f2b15e"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#bg)"/>
+  <path d="M72 40h76l36 36v132c0 9.941-8.059 18-18 18H72c-9.941 0-18-8.059-18-18V58c0-9.941 8.059-18 18-18Z" fill="url(#page)"/>
+  <path d="M148 40v30c0 9.941 8.059 18 18 18h18Z" fill="#b8ccd8"/>
+  <path d="M84 168v-70h32c22.091 0 40 17.909 40 40s-17.909 40-40 40Zm18-16h14c13.255 0 24-10.745 24-24s-10.745-24-24-24h-14Z" fill="#113a52"/>
+  <path d="M172 99a26 26 0 0 0-18.54 7.765A24.606 24.606 0 0 1 160 124c0 9.25-5.082 17.345-12.607 21.63A25.968 25.968 0 0 0 172 163c14.359 0 26-11.641 26-32s-11.641-32-26-32Z" fill="url(#accent)"/>
+  <rect x="84" y="74" width="86" height="8" rx="4" fill="#bfd0da"/>
+  <rect x="84" y="185" width="68" height="8" rx="4" fill="#bfd0da"/>
+</svg>

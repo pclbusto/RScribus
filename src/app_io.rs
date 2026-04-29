@@ -19,6 +19,33 @@ pub fn show_preferences_dialog(root: &adw::ApplicationWindow) {
     );
 }
 
+pub fn new_project_dialog(
+    root: &adw::ApplicationWindow,
+    sender: ComponentSender<AppModel>,
+    dirty: bool,
+) {
+    if !dirty {
+        sender.input(AppInput::NewProjectConfirmed);
+        return;
+    }
+
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message("Unsaved Changes")
+        .detail("You have unsaved changes. Starting a new project will lose these changes. Continue?")
+        .buttons(["Cancel", "Discard and New"])
+        .cancel_button(0)
+        .default_button(1)
+        .build();
+
+    let s = sender.clone();
+    dialog.choose(Some(root), None::<&gtk::gio::Cancellable>, move |res| {
+        if res == Ok(1) {
+            s.input(AppInput::NewProjectConfirmed);
+        }
+    });
+}
+
 pub fn save_project_dialog(
     root: &adw::ApplicationWindow,
     sender: ComponentSender<AppModel>,

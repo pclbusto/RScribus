@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=RScribus
+Comment=Desktop publishing and page layout editor
+Exec=RScribus
+Icon=org.rscribus.RScribus
+Terminal=false
+Categories=Graphics;Publishing;GTK;
+Keywords=layout;desktop publishing;document;gtk;rust;
+StartupWMClass=org.rscribus.RScribus

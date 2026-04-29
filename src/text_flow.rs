@@ -27,7 +27,6 @@ impl PrecomputedFlowProvider {
     /// Build from rectangular obstacles in frame-local pixel space.
     /// `obstacles`: list of `(rel_x, rel_y, w, h)` in pixels.
     /// `padding_px`: safety margin eroded from each obstacle edge.
-    #[cfg(test)]
     pub fn from_rect_obstacles(
         frame_w_px: usize,
         frame_h_px: usize,
@@ -73,7 +72,6 @@ impl TextFlowProvider for PrecomputedFlowProvider {
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Remove the horizontal range `[sub_start, sub_end)` from a list of intervals.
-#[cfg(test)]
 fn subtract_range(intervals: &[Interval], sub_start: f64, sub_end: f64) -> Vec<Interval> {
     if sub_start >= sub_end { return intervals.to_vec(); }
     let mut result = Vec::new();

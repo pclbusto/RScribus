@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 cairo-rs = { version = "0.22.0", features = ["pdf"] }
 pangocairo = "0.22"
-gtk4 = { version = "0.11", features = ["v4_10"] }
+gtk4 = { version = "0.11", features = ["v4_14"] }
 libadwaita = { version = "0.9.1", features = ["v1_6"] }
 relm4 = { version = "0.11.0", features = ["libadwaita"] }
 serde = { version = "1.0.228", features = ["derive"] }

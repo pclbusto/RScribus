@@ -4,7 +4,7 @@ use gtk::gdk;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use crate::app_dialogs::show_info_dialog;
+use crate::app_dialogs::{show_info_dialog, show_keyboard_shortcuts_window};
 use crate::app_io::{export_pdf_dialog, open_project_dialog, save_project_dialog, show_preferences_dialog};
 use crate::document::{Document, Item, ItemContent, ItemType};
 use crate::text_box::{TextBox, KeyAction, AttrValue, AttrSnapshot, TextAlign, TextAttribute};
@@ -20,6 +20,13 @@ pub enum PageLayout {
     Horizontal,
 }
 
+struct EditLayoutCache {
+    item_id: String,
+    frame_w_px: f64,
+    padding_px: f64,
+    layout: gtk::pango::Layout,
+}
+
 pub struct AppModel {
     document: Document,
     current_page: usize,
@@ -32,6 +39,7 @@ pub struct AppModel {
     is_moving: bool,
     popover_pos: (f64, f64),
     popover_visible: bool,
+    popover_page_idx: Option<usize>,
     /// Number of upcoming DragStart events to swallow.
     /// Menu actions can close the popover twice in practice
     /// (explicit state change + GTK closed signal), so this is a counter
@@ -70,6 +78,10 @@ pub struct AppModel {
     /// Rebuilt whenever an image's WrapMode, position, or size changes.
     flow_providers: HashMap<String, PrecomputedFlowProvider>,
     autoscroll_timer: Option<gtk::glib::SourceId>,
+    show_sidebar: bool,
+    dirty: bool,
+    edit_layout_cache: Option<EditLayoutCache>,
+    pending_wrap_rebuild: bool,
 }
 
 impl AppModel {
@@ -81,9 +93,79 @@ impl AppModel {
         self.pending_drag_start_swallows = self.pending_drag_start_swallows.saturating_add(1);
     }
 
+    fn reset_pointer_interaction(&mut self) {
+        self.drag_start = None;
+        self.drag_current = None;
+        self.drag_offset = (0.0, 0.0);
+        self.initial_item_rects.clear();
+        self.active_handle = None;
+        self.is_moving = false;
+        self.text_drag_active = false;
+        self.link_drag_active = false;
+        self.link_drag_source_id = None;
+        self.link_drag_start = None;
+        self.link_drag_current = None;
+    }
+
+    fn reset_to_new_project(&mut self) {
+        self.document = Document::default();
+        self.current_page = 0;
+        self.reset_pointer_interaction();
+        self.popover_visible = false;
+        self.popover_page_idx = None;
+        self.selected_item_ids.clear();
+        self.is_editing = false;
+        *self.editing_flag.borrow_mut() = false;
+        self.invalidate_edit_layout();
+        self.image_surfaces.clear();
+        self.svg_handles.clear();
+        self.last_save_path = None;
+        self.dirty = false;
+        self.flow_providers.clear();
+        self.pending_wrap_rebuild = false;
+        self.rebuild_flow_providers();
+    }
+
     fn close_popover_and_skip_drag(&mut self) {
         self.popover_visible = false;
+        self.popover_page_idx = None;
+        self.reset_pointer_interaction();
         self.swallow_upcoming_drag_start();
+    }
+
+    fn invalidate_edit_layout(&mut self) {
+        self.edit_layout_cache = None;
+    }
+
+    fn page_index_for_canvas_coords(&self, x_px: f64, y_px: f64) -> usize {
+        let x_mm = x_px / self.scale();
+        let y_mm = y_px / self.scale();
+        let page_gap = 20.0;
+        let idx = match self.page_layout {
+            PageLayout::Vertical => (y_mm / (self.document.height + page_gap)).floor() as i32,
+            PageLayout::Horizontal => (x_mm / (self.document.width + page_gap)).floor() as i32,
+        };
+        (idx.max(0) as usize).min(self.document.pages.len().saturating_sub(1))
+    }
+
+    fn page_at_canvas_coords(&self, x_px: f64, y_px: f64) -> Option<usize> {
+        let x_mm = x_px / self.scale();
+        let y_mm = y_px / self.scale();
+
+        for (page_idx, _page) in self.document.pages.iter().enumerate().rev() {
+            let (off_x, off_y) = self.get_page_offset(page_idx);
+            let local_x = x_mm - off_x;
+            let local_y = y_mm - off_y;
+            if local_x >= 0.0
+                && local_x <= self.document.width
+                && local_y >= 0.0
+                && local_y <= self.document.height
+            {
+                return Some(page_idx);
+            }
+        }
+
+        None
     }
 
     fn refresh_cursor_snapshot(&mut self) {
@@ -177,6 +259,238 @@ impl AppModel {
         }
     }
 
+    fn frame_visible_local_range(&self, id: &str) -> Option<(usize, usize)> {
+        let (_, item) = self.find_item(id)?;
+        let tb = match &item.content {
+            ItemContent::Text(tb) => tb,
+            _ => return None,
+        };
+
+        if !is_in_chain(&self.document, id) {
+            return Some((0, tb.text.len()));
+        }
+
+        let chain = collect_chain(&self.document, &find_chain_root(&self.document, id));
+        let idx = chain.iter().position(|cid| cid == id)?;
+        let current_offset = tb.text_offset;
+        let visible_end = if let Some(next_id) = chain.get(idx + 1) {
+            self.find_item(next_id)
+                .and_then(|(_, next_item)| {
+                    if let ItemContent::Text(next_tb) = &next_item.content {
+                        Some(next_tb.text_offset.saturating_sub(current_offset))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(tb.text.len())
+        } else {
+            tb.text.len()
+        };
+
+        Some((0, visible_end.min(tb.text.len())))
+    }
+
+    fn selected_text_operation_range(&self, id: &str, editing: bool) -> Option<(usize, usize)> {
+        let (_, item) = self.find_item(id)?;
+        let tb = match &item.content {
+            ItemContent::Text(tb) => tb,
+            _ => return None,
+        };
+
+        if editing {
+            Some(tb.selection_or_word_range())
+        } else {
+            self.frame_visible_local_range(id)
+        }
+    }
+
+    fn selected_has_wrapped_image(&self) -> bool {
+        self.selected_item_ids.iter().any(|id| {
+            self.find_item(id)
+                .map(|(_, item)| matches!(
+                    item.content,
+                    ItemContent::Image(ref ib) if ib.wrap_mode != WrapMode::Independent
+                ))
+                .unwrap_or(false)
+        })
+    }
+
+    fn get_or_build_edit_layout(
+        &mut self,
+        id: &str,
+        pango_ctx: &gtk::pango::Context,
+        frame_w_px: f64,
+        scale_factor: f64,
+    ) -> Option<gtk::pango::Layout> {
+        let (_, item) = self.find_item(id)?;
+        let tb = match &item.content {
+            ItemContent::Text(tb) => tb,
+            _ => return None,
+        };
+        let padding_px = tb.padding * scale_factor;
+
+        let cache_valid = self.edit_layout_cache.as_ref().map(|cache| {
+            cache.item_id == id
+                && (cache.frame_w_px - frame_w_px).abs() < 0.01
+                && (cache.padding_px - padding_px).abs() < 0.01
+        }).unwrap_or(false);
+
+        if cache_valid {
+            return self.edit_layout_cache.as_ref().map(|cache| cache.layout.clone());
+        }
+
+        let started = std::time::Instant::now();
+        let layout = tb.prepare_layout(pango_ctx, frame_w_px, padding_px);
+        let elapsed = started.elapsed();
+        if tb.text.len() > 2_000 || elapsed.as_millis() >= 8 {
+            eprintln!(
+                "[perf] build_edit_layout id={} text_len={} attrs={} linked={} width_px={:.1} took={}ms",
+                id,
+                tb.text.len(),
+                tb.attributes.len(),
+                tb.next_frame_id.is_some() || tb.prev_frame_id.is_some(),
+                frame_w_px,
+                elapsed.as_millis()
+            );
+        }
+        self.edit_layout_cache = Some(EditLayoutCache {
+            item_id: id.to_string(),
+            frame_w_px,
+            padding_px,
+            layout: layout.clone(),
+        });
+        Some(layout)
+    }
+
+    fn ensure_cursor_visible_cached(
+        &mut self,
+        id: &str,
+        w: f64,
+        h: f64,
+        scale_factor: f64,
+    ) -> Option<f64> {
+        let (_, item) = self.find_item(id)?;
+        let tb = match &item.content {
+            ItemContent::Text(tb) => tb,
+            _ => return None,
+        };
+        let pango_ctx = make_pango_ctx();
+        let layout = self.get_or_build_edit_layout(id, &pango_ctx, w, scale_factor)?;
+        let padding = tb.padding * scale_factor;
+        let pscale = gtk::pango::SCALE as f64;
+
+        let byte_idx = tb.cursor_pos.min(tb.text.len()) as i32;
+        let (strong, _) = layout.cursor_pos(byte_idx);
+        let cursor_top = padding + strong.y() as f64 / pscale;
+        let cursor_bot = cursor_top + strong.height() as f64 / pscale;
+
+        let new_scroll = if cursor_bot > tb.scroll_y + h {
+            cursor_bot - h
+        } else if cursor_top < tb.scroll_y {
+            cursor_top
+        } else {
+            return Some(tb.scroll_y);
+        };
+
+        let (_, ph) = layout.size();
+        let total_h = ph as f64 / pscale + 2.0 * padding;
+        Some(new_scroll.clamp(0.0, (total_h - h).max(0.0)))
+    }
+
+    fn required_height_cached(&mut self, id: &str, w: f64, scale_factor: f64) -> Option<f64> {
+        let (_, item) = self.find_item(id)?;
+        let tb = match &item.content {
+            ItemContent::Text(tb) => tb,
+            _ => return None,
+        };
+        let pango_ctx = make_pango_ctx();
+        let layout = self.get_or_build_edit_layout(id, &pango_ctx, w, scale_factor)?;
+        let padding = tb.padding * scale_factor;
+        let (_, ph) = layout.size();
+        Some(ph as f64 / gtk::pango::SCALE as f64 + 2.0 * padding)
+    }
+
+    fn move_cursor_vertical_cached(
+        &mut self,
+        id: &str,
+        up: bool,
+        extend: bool,
+        frame_w_px: f64,
+        scale_factor: f64,
+    ) {
+        let Some((_, item)) = self.find_item(id) else { return; };
+        let tb = match &item.content {
+            ItemContent::Text(tb) => tb,
+            _ => return,
+        };
+        let pango_ctx = make_pango_ctx();
+        let Some(layout) = self.get_or_build_edit_layout(id, &pango_ctx, frame_w_px, scale_factor) else { return; };
+
+        let byte_idx = tb.cursor_pos.min(tb.text.len()) as i32;
+        let (strong, _) = layout.cursor_pos(byte_idx);
+        let cur_x = strong.x();
+        let cur_y = strong.y();
+        let line_h = strong.height();
+        let new_y = if up { cur_y - line_h / 2 } else { cur_y + line_h + line_h / 2 };
+
+        let mut new_anchor = tb.selection_anchor;
+        if extend && new_anchor.is_none() {
+            new_anchor = Some(tb.cursor_pos);
+        } else if !extend {
+            new_anchor = None;
+        }
+
+        let new_pos = if new_y < 0 {
+            0
+        } else {
+            let (_inside, new_byte, trailing) = layout.xy_to_index(cur_x, new_y);
+            let mut pos = new_byte as usize;
+            if trailing > 0 && pos < tb.text.len() {
+                pos = next_char_boundary_local(&tb.text, pos);
+            }
+            pos
+        };
+
+        if let Some(tb_mut) = self.get_editing_text_box_mut() {
+            tb_mut.selection_anchor = new_anchor;
+            tb_mut.cursor_pos = new_pos;
+        }
+    }
+
+    fn hit_test_cached(
+        &mut self,
+        id: &str,
+        frame_x: f64,
+        frame_y: f64,
+        click_x_mm: f64,
+        click_y_mm: f64,
+        scale: f64,
+        frame_w_px: f64,
+    ) -> Option<usize> {
+        let (_, item) = self.find_item(id)?;
+        let tb = match &item.content {
+            ItemContent::Text(tb) => tb,
+            _ => return None,
+        };
+        let pango_ctx = make_pango_ctx();
+        let layout = self.get_or_build_edit_layout(id, &pango_ctx, frame_w_px, scale)?;
+        let pscale = gtk::pango::SCALE as f64;
+        let padding = tb.padding * scale;
+
+        let rel_x = (click_x_mm - frame_x) * scale - padding;
+        let rel_y = (click_y_mm - frame_y) * scale - padding + tb.scroll_y;
+        let x_pango = (rel_x * pscale).max(0.0) as i32;
+        let y_pango = (rel_y * pscale).max(0.0) as i32;
+        let (_inside, byte_idx, trailing) = layout.xy_to_index(x_pango, y_pango);
+        let byte_idx = byte_idx as usize;
+
+        Some(if trailing > 0 && byte_idx < tb.text.len() {
+            next_char_boundary_local(&tb.text, byte_idx)
+        } else {
+            byte_idx
+        })
+    }
+
     fn process_drag(&mut self) {
         let (offset_x, offset_y) = self.drag_offset;
 
@@ -193,24 +507,31 @@ impl AppModel {
                 let x_mm = (sx + offset_x) / self.scale();
                 let y_mm = (sy + offset_y) / self.scale();
 
-                let hit_data = if let Some(id) = self.selected_item_ids.first() {
-                    self.find_item(id).map(|(page_idx, item)| {
+                let hit_data = if let Some(id) = self.selected_item_ids.first().cloned() {
+                    if let Some((page_idx, item)) = self.find_item(&id) {
                         let (off_x, off_y) = self.get_page_offset(page_idx);
                         let local_x = x_mm - off_x;
                         let local_y = y_mm - off_y;
-                        let pos = if let ItemContent::Text(ref tb) = item.content {
-                            tb.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                        let pos = if matches!(item.content, ItemContent::Text(_)) {
+                            self.hit_test_cached(&id, item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                                .unwrap_or(0)
                         } else { 0 };
-                        (pos, item.width * SCALE, item.height * SCALE)
-                    })
+                        Some((pos, item.width * SCALE, item.height * SCALE))
+                    } else {
+                        None
+                    }
                 } else { None };
 
                 if let Some((pos, w, h)) = hit_data {
-                    let pango_ctx = make_pango_ctx();
                     if let Some(tb) = self.get_editing_text_box_mut() {
                         tb.cursor_pos = pos;
-                        let s = tb.ensure_cursor_visible(&pango_ctx, w, h, SCALE);
-                        tb.scroll_y = s;
+                    }
+                    if let Some(id) = self.selected_item_ids.first().cloned() {
+                        if let Some(s) = self.ensure_cursor_visible_cached(&id, w, h, SCALE) {
+                            if let Some(tb) = self.get_editing_text_box_mut() {
+                                tb.scroll_y = s;
+                            }
+                        }
                     }
                 }
             }
@@ -266,7 +587,9 @@ impl AppModel {
                             if item.height < 1.0 { item.height = 1.0; }
                         }
 
-                        self.rebuild_flow_providers();
+                        if self.selected_has_wrapped_image() {
+                            self.pending_wrap_rebuild = true;
+                        }
                     }
                 }
             } else if is_moving {
@@ -332,8 +655,11 @@ impl AppModel {
                     }
                 }
 
-                self.rebuild_flow_providers();
+                if self.selected_has_wrapped_image() {
+                    self.pending_wrap_rebuild = true;
+                }
             }
+            self.dirty = true;
         }
     }
 
@@ -409,6 +735,7 @@ pub enum AppInput {
     DeleteItem,
     SetPageLayout(PageLayout),
     ShowPreferences,
+    ShowKeyboardShortcuts,
     SaveProject,
     OpenProject,
     ExportPdf,
@@ -425,8 +752,6 @@ pub enum AppInput {
     UnlinkFrame,
     SetWrapMode(WrapMode),
     SetShowBorder(bool),
-    /// Fired by the debounce timer; ignored if `version` no longer matches.
-    MaybeReflow(u64),
     Undo,
     Redo,
     CutText,
@@ -436,6 +761,11 @@ pub enum AppInput {
     CanvasReady,
     Autoscroll,
     AdjustDragOffset(f64, f64),
+    ToggleSidebar,
+    NewProject,
+    NewProjectConfirmed,
+    MaybeReflow(u64),
+    DeletePage,
 }
 
 #[derive(Debug)]
@@ -465,6 +795,11 @@ impl Component for AppModel {
                         set_subtitle: "RScribus",
                     },
                     pack_start = &gtk::Button {
+                        set_icon_name: "document-new-symbolic",
+                        set_tooltip_text: Some("New Project"),
+                        connect_clicked => AppInput::NewProject,
+                    },
+                    pack_start = &gtk::Button {
                         set_icon_name: "list-add-symbolic",
                         set_tooltip_text: Some("Add Page"),
                         connect_clicked => AppInput::AddPage,
@@ -483,6 +818,11 @@ impl Component for AppModel {
                         set_icon_name: "printer-symbolic",
                         set_tooltip_text: Some("Export to PDF"),
                         connect_clicked => AppInput::ExportPdf,
+                    },
+                    pack_end = &gtk::Button {
+                        set_icon_name: "help-about-symbolic",
+                        set_tooltip_text: Some("Toggle Properties"),
+                        connect_clicked => AppInput::ToggleSidebar,
                     },
                     pack_end = &gtk::MenuButton {
                         set_icon_name: "open-menu-symbolic",
@@ -512,6 +852,14 @@ impl Component for AppModel {
                                 },
                                 gtk::Separator {},
                                 gtk::Button {
+                                    set_label: "Keyboard Shortcuts",
+                                    set_has_frame: false,
+                                    connect_clicked[sender] => move |btn| {
+                                        sender.input(AppInput::ShowKeyboardShortcuts);
+                                        btn.ancestor(gtk::Popover::static_type()).and_then(|p| p.downcast::<gtk::Popover>().ok()).map(|p| p.popdown());
+                                    },
+                                },
+                                gtk::Button {
                                     set_label: "Preferences",
                                     set_has_frame: false,
                                     connect_clicked[sender] => move |btn| {
@@ -526,7 +874,8 @@ impl Component for AppModel {
 
                 adw::OverlaySplitView {
                     set_sidebar_position: gtk::PackType::End,
-                    set_show_sidebar: true,
+                    #[watch]
+                    set_show_sidebar: model.show_sidebar,
 
                     #[wrap(Some)]
                     set_sidebar = &gtk::Box {
@@ -821,8 +1170,10 @@ impl Component for AppModel {
                                             model.link_drag_start.zip(model.link_drag_current)
                                         } else { None };
                                         let flow_providers = model.flow_providers.clone();
+                                        let editing_layout = model.edit_layout_cache.as_ref()
+                                            .map(|cache| (cache.item_id.clone(), cache.layout.clone()));
                                         move |_area, cr, _w, _h| {
-                                            draw_canvas(cr, &doc, d_start, d_current, &selected, editing, &images, &svgs, zoom, layout, link_drag, &flow_providers);
+                                            draw_canvas(cr, &doc, d_start, d_current, &selected, editing, &images, &svgs, zoom, layout, link_drag, &flow_providers, editing_layout.as_ref());
                                         }
                                     },
 
@@ -893,6 +1244,23 @@ impl Component for AppModel {
                                         set_orientation: gtk::Orientation::Vertical,
                                         set_spacing: 6,
                                         set_margin_all: 10,
+
+                                        // Page actions
+                                        gtk::Button {
+                                            set_label: "Eliminar Página",
+                                            add_css_class: "destructive-action",
+                                            #[watch]
+                                            set_visible: model.selected_item_ids.is_empty()
+                                                && model.document.pages.len() > 1
+                                                && model.popover_page_idx.is_some(),
+                                            connect_clicked => AppInput::DeletePage,
+                                        },
+                                        gtk::Separator {
+                                            #[watch]
+                                            set_visible: model.selected_item_ids.is_empty()
+                                                && model.document.pages.len() > 1
+                                                && model.popover_page_idx.is_some(),
+                                        },
 
                                         gtk::Label {
                                             set_label: "Frame Information",
@@ -1202,6 +1570,7 @@ impl Component for AppModel {
             is_moving: false,
             popover_pos: (0.0, 0.0),
             popover_visible: false,
+            popover_page_idx: None,
             pending_drag_start_swallows: 0,
             is_editing: false,
             text_drag_active: false,
@@ -1226,6 +1595,10 @@ impl Component for AppModel {
             canvas_ready: true,
             flow_providers: HashMap::new(),
             autoscroll_timer: None,
+            show_sidebar: true,
+            dirty: false,
+            edit_layout_cache: None,
+            pending_wrap_rebuild: false,
         };
 
         let widgets = view_output!();
@@ -1318,7 +1691,13 @@ impl Component for AppModel {
 
         if self.request_focus {
             self.request_focus = false;
+            let vadj = widgets.scrolled_window.vadjustment();
+            let hadj = widgets.scrolled_window.hadjustment();
+            let saved_v = vadj.value();
+            let saved_h = hadj.value();
             widgets.canvas.grab_focus();
+            vadj.set_value(saved_v);
+            hadj.set_value(saved_h);
         }
     }
 
@@ -1330,8 +1709,12 @@ impl Component for AppModel {
             AppInput::ShowPreferences => {
                 show_preferences_dialog(root);
             }
+            AppInput::ShowKeyboardShortcuts => {
+                show_keyboard_shortcuts_window(root);
+            }
             AppInput::AddPage => {
                 self.document.pages.push(crate::document::Page::default());
+                self.dirty = true;
             }
             AppInput::ClosePopover => {
                 self.close_popover_and_skip_drag();
@@ -1355,10 +1738,13 @@ impl Component for AppModel {
                         .and_then(|id| self.find_item(id))
                         .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
                     if let Some((w, h)) = item_dims {
-                        let pango_ctx = make_pango_ctx();
-                        if let Some(tb) = self.get_editing_text_box_mut() {
-                            let s = tb.ensure_cursor_visible(&pango_ctx, w, h, SCALE);
-                            tb.scroll_y = s;
+                        if let Some(id) = self.selected_item_ids.first().cloned() {
+                            self.invalidate_edit_layout();
+                            if let Some(s) = self.ensure_cursor_visible_cached(&id, w, h, SCALE) {
+                                if let Some(tb) = self.get_editing_text_box_mut() {
+                                    tb.scroll_y = s;
+                                }
+                            }
                         }
                     }
                 }
@@ -1624,56 +2010,170 @@ impl Component for AppModel {
                 }
             }
             AppInput::DeleteItem => {
-                let to_delete: Vec<String> = self.selected_item_ids.clone();
-                self.selected_item_ids.clear();
-                for id in &to_delete {
-                    for page in &mut self.document.pages {
-                        page.items.retain(|item| &item.id != id);
+                let to_delete: std::collections::HashSet<String> =
+                    self.selected_item_ids.iter().cloned().collect();
+                let chain_roots: std::collections::HashSet<String> = to_delete.iter()
+                    .filter(|id| is_in_chain(&self.document, id))
+                    .map(|id| find_chain_root(&self.document, id))
+                    .collect();
+
+                for root_id in &chain_roots {
+                    let editing_id = if self.is_editing {
+                        self.selected_item_ids.first()
+                            .filter(|id| find_chain_root(&self.document, id) == *root_id)
+                            .map(|id| id.as_str())
+                    } else {
+                        None
+                    };
+                    let sc = self.scale();
+                    reflow_chain(&mut self.document, root_id, sc, editing_id);
+                }
+
+                for root_id in chain_roots {
+                    let chain = collect_chain(&self.document, &root_id);
+                    let remaining: Vec<String> = chain.iter()
+                        .filter(|id| !to_delete.contains(*id))
+                        .cloned()
+                        .collect();
+                    if remaining.is_empty() {
+                        continue;
+                    }
+
+                    let root_tb = chain_frame_textbox(&self.document, &root_id).cloned();
+                    if let Some(root_tb) = root_tb {
+                        let new_root_id = remaining[0].clone();
+                        set_chain_links(&mut self.document, &remaining);
+                        set_chain_frame_content(
+                            &mut self.document,
+                            &new_root_id,
+                            root_tb.text.clone(),
+                            root_tb.attributes.clone(),
+                            0,
+                        );
+                        if remaining.len() >= 2 {
+                            let sc = self.scale();
+                            reflow_chain(&mut self.document, &new_root_id, sc, None);
+                        }
                     }
                 }
+
+                self.selected_item_ids.clear();
+                for page in &mut self.document.pages {
+                    page.items.retain(|item| !to_delete.contains(&item.id));
+                }
+                self.dirty = true;
             }
             AppInput::PasteText(text) => {
                 if !self.is_editing { return; }
                 self.flush_history(); // push pre-paste state, close typing run
                 if let Some(tb) = self.get_editing_text_box_mut() {
                     tb.insert_text(&text);
+                    self.dirty = true;
                 }
+                self.invalidate_edit_layout();
+
                 if let Some(id) = self.selected_item_ids.first().cloned() {
                     if is_in_chain(&self.document, &id) {
-                        self.reflow_version = self.reflow_version.wrapping_add(1);
-                        let version = self.reflow_version;
-                        let s = sender.clone();
-                        gtk::glib::timeout_add_local(
-                            std::time::Duration::from_millis(250),
-                            move || {
-                                s.input(AppInput::MaybeReflow(version));
-                                gtk::glib::ControlFlow::Break
-                            },
-                        );
+                        let sc = self.scale();
+                        reflow_chain(&mut self.document, &id, sc, Some(id.as_str()));
                     }
                 }
+
                 let item_dims = self.selected_item_ids.first()
                     .and_then(|id| self.find_item(id))
                     .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
                 if let Some((w, h)) = item_dims {
-                    let pango_ctx = make_pango_ctx();
-                    if let Some(tb) = self.get_editing_text_box_mut() {
-                        let s = tb.ensure_cursor_visible(&pango_ctx, w, h, SCALE);
-                        tb.scroll_y = s;
+                    if let Some(id) = self.selected_item_ids.first().cloned() {
+                        if let Some(s) = self.ensure_cursor_visible_cached(&id, w, h, SCALE) {
+                            if let Some(tb) = self.get_editing_text_box_mut() {
+                                tb.scroll_y = s;
+                            }
+                        }
                     }
                 }
             }
             AppInput::TextKeyPressed(key, state) => {
+                let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+
+                if ctrl && key == gdk::Key::F1 {
+                    sender.input(AppInput::ShowKeyboardShortcuts);
+                    return;
+                }
+
                 if !self.is_editing {
+                    if ctrl {
+                        match key {
+                            gdk::Key::plus | gdk::Key::KP_Add | gdk::Key::equal => {
+                                sender.input(AppInput::AddPage);
+                                return;
+                            }
+                            gdk::Key::n | gdk::Key::N => {
+                                sender.input(AppInput::NewProject);
+                                return;
+                            }
+                            gdk::Key::o | gdk::Key::O => {
+                                sender.input(AppInput::OpenProject);
+                                return;
+                            }
+                            gdk::Key::s | gdk::Key::S => {
+                                sender.input(AppInput::SaveProject);
+                                return;
+                            }
+                            gdk::Key::p | gdk::Key::P => {
+                                sender.input(AppInput::ExportPdf);
+                                return;
+                            }
+                            gdk::Key::l | gdk::Key::L => {
+                                sender.input(AppInput::ToggleSidebar);
+                                return;
+                            }
+                            gdk::Key::t | gdk::Key::T => {
+                                sender.input(AppInput::SetCreateFrameType(ItemType::TextFrame));
+                                return;
+                            }
+                            gdk::Key::i | gdk::Key::I => {
+                                sender.input(AppInput::SetCreateFrameType(ItemType::ImageFrame));
+                                return;
+                            }
+                            gdk::Key::g | gdk::Key::G => {
+                                sender.input(AppInput::SetCreateFrameType(ItemType::SvgFrame));
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     if (key == gdk::Key::Delete || key == gdk::Key::BackSpace) && !self.selected_item_ids.is_empty() {
                         sender.input(AppInput::DeleteItem);
                     }
                     return;
                 }
 
+                // Global shortcuts that should work even when editing
+                if ctrl {
+                    match key {
+                        gdk::Key::n | gdk::Key::N => {
+                            sender.input(AppInput::NewProject);
+                            return;
+                        }
+                        gdk::Key::s | gdk::Key::S => {
+                            sender.input(AppInput::SaveProject);
+                            return;
+                        }
+                        gdk::Key::o | gdk::Key::O => {
+                            sender.input(AppInput::OpenProject);
+                            return;
+                        }
+                        gdk::Key::p | gdk::Key::P => {
+                            sender.input(AppInput::ExportPdf);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
                 // Classify whether this key will modify text BEFORE calling handle_key,
                 // so we can push the pre-edit state to the undo stack first.
-                let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
                 let will_modify = !ctrl && (
                     matches!(key,
                         gdk::Key::BackSpace | gdk::Key::Delete |
@@ -1690,16 +2190,29 @@ impl Component for AppModel {
                 }
 
                 let action = if let Some(tb) = self.get_editing_text_box_mut() {
-                    tb.handle_key(key, state)
+                    let a = tb.handle_key(key, state);
+                    if will_modify {
+                        self.dirty = true;
+                        self.invalidate_edit_layout();
+                    }
+                    a
                 } else {
                     return;
                 };
 
                 match action {
                     KeyAction::ExitEdit => {
+                        if let Some(id) = self.selected_item_ids.first().cloned() {
+                            if is_in_chain(&self.document, &id) {
+                                let sc = self.scale();
+                                reflow_chain(&mut self.document, &id, sc, Some(id.as_str()));
+                                self.reflow_version = self.reflow_version.wrapping_add(1);
+                            }
+                        }
                         self.typing_run_active = false;
                         self.is_editing = false;
                         *self.editing_flag.borrow_mut() = false;
+                        self.invalidate_edit_layout();
                         if let Some(tb) = self.get_editing_text_box_mut() {
                             tb.selection_anchor = None;
                             tb.scroll_y = 0.0;
@@ -1725,8 +2238,8 @@ impl Component for AppModel {
                             .and_then(|id| self.find_item(id))
                             .map(|(_, item)| item.width * SCALE)
                             .unwrap_or(0.0);
-                        if let Some(tb) = self.get_editing_text_box_mut() {
-                            tb.move_cursor_vertical(up, extend, frame_w_px, SCALE);
+                        if let Some(id) = self.selected_item_ids.first().cloned() {
+                            self.move_cursor_vertical_cached(&id, up, extend, frame_w_px, SCALE);
                         }
                     }
                     KeyAction::FormatBold => {
@@ -1751,30 +2264,19 @@ impl Component for AppModel {
 
                 if will_modify {
                     self.schedule_history_commit(&sender);
+                    self.invalidate_edit_layout();
                 }
 
-                if let Some(id) = self.selected_item_ids.first().cloned() {
-                    if is_in_chain(&self.document, &id) {
-                        self.reflow_version = self.reflow_version.wrapping_add(1);
-                        let version = self.reflow_version;
-                        let s = sender.clone();
-                        gtk::glib::timeout_add_local(
-                            std::time::Duration::from_millis(250),
-                            move || {
-                                s.input(AppInput::MaybeReflow(version));
-                                gtk::glib::ControlFlow::Break
-                            },
-                        );
-                    }
-                }
                 let item_dims = self.selected_item_ids.first()
                     .and_then(|id| self.find_item(id))
                     .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
                 if let Some((w, h)) = item_dims {
-                    let pango_ctx = make_pango_ctx();
-                    if let Some(tb) = self.get_editing_text_box_mut() {
-                        let s = tb.ensure_cursor_visible(&pango_ctx, w, h, SCALE);
-                        tb.scroll_y = s;
+                    if let Some(id) = self.selected_item_ids.first().cloned() {
+                        if let Some(s) = self.ensure_cursor_visible_cached(&id, w, h, SCALE) {
+                            if let Some(tb) = self.get_editing_text_box_mut() {
+                                tb.scroll_y = s;
+                            }
+                        }
                     }
                 }
             }
@@ -1787,11 +2289,13 @@ impl Component for AppModel {
                     .and_then(|id| self.find_item(id))
                     .map(|(_, item)| (item.width * SCALE, item.height * SCALE));
                 if let Some((w, h)) = item_dims {
-                    let pango_ctx = make_pango_ctx();
-                    if let Some(tb) = self.get_editing_text_box_mut() {
-                        let total_h = tb.required_height(&pango_ctx, w, SCALE);
-                        let max_scroll = (total_h - h).max(0.0);
-                        tb.scroll_y = (tb.scroll_y + dy * 40.0).clamp(0.0, max_scroll);
+                    if let Some(id) = self.selected_item_ids.first().cloned() {
+                        if let Some(total_h) = self.required_height_cached(&id, w, SCALE) {
+                            if let Some(tb) = self.get_editing_text_box_mut() {
+                                let max_scroll = (total_h - h).max(0.0);
+                                tb.scroll_y = (tb.scroll_y + dy * 40.0).clamp(0.0, max_scroll);
+                            }
+                        }
                     }
                 }
             }
@@ -1821,7 +2325,7 @@ impl Component for AppModel {
                                 let pango_ctx = make_pango_ctx();
                                 let w_px = item.width * SCALE;
                                 let h_px = item.height * SCALE;
-                                if tb.required_height(&pango_ctx, w_px, SCALE) > h_px
+                                if tb.overflows_frame(&pango_ctx, w_px, h_px, SCALE)
                                     && hit_link_button_mm(item, local_x, local_y)
                                 {
                                     self.link_drag_active = true;
@@ -1845,8 +2349,9 @@ impl Component for AppModel {
                             let (off_x, off_y) = self.get_page_offset(page_idx);
                             let local_x = x_mm - off_x;
                             let local_y = y_mm - off_y;
-                            let pos = if let ItemContent::Text(ref tb) = item.content {
-                                tb.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                            let pos = if matches!(item.content, ItemContent::Text(_)) {
+                                self.hit_test_cached(&item.id, item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                                    .unwrap_or(0)
                             } else { 0 };
                             
                             if let Some(tb) = self.get_editing_text_box_mut() {
@@ -1859,8 +2364,16 @@ impl Component for AppModel {
                             return;
                         }
                     }
+                    if let Some(id) = self.selected_item_ids.first().cloned() {
+                        if is_in_chain(&self.document, &id) {
+                            let sc = self.scale();
+                            reflow_chain(&mut self.document, &id, sc, Some(id.as_str()));
+                            self.reflow_version = self.reflow_version.wrapping_add(1);
+                        }
+                    }
                     self.is_editing = false;
                     *self.editing_flag.borrow_mut() = false;
+                    self.invalidate_edit_layout();
                     if let Some(tb) = self.get_editing_text_box_mut() {
                         tb.selection_anchor = None;
                         tb.scroll_y = 0.0;
@@ -1929,18 +2442,6 @@ impl Component for AppModel {
                     self.is_moving = false;
                     self.active_handle = None;
                     self.request_focus = true;
-                    
-                    // Determine current page based on layout
-                    let page_gap = 20.0;
-                    match self.page_layout {
-                        PageLayout::Vertical => {
-                            self.current_page = (y_mm / (self.document.height + page_gap)).floor() as usize;
-                        }
-                        PageLayout::Horizontal => {
-                            self.current_page = (x_mm / (self.document.width + page_gap)).floor() as usize;
-                        }
-                    }
-                    self.current_page = self.current_page.min(self.document.pages.len().saturating_sub(1));
                 }
             }
             AppInput::DragUpdate(offset_x, offset_y) => {
@@ -1952,14 +2453,45 @@ impl Component for AppModel {
                 self.drag_offset.1 += dy;
                 self.process_drag();
             }
+            AppInput::ToggleSidebar => {
+                self.show_sidebar = !self.show_sidebar;
+            }
+            AppInput::NewProject => {
+                crate::app_io::new_project_dialog(root, sender, self.dirty);
+            }
+            AppInput::NewProjectConfirmed => {
+                self.reset_to_new_project();
+            }
+            AppInput::MaybeReflow(_version) => {}
+            AppInput::DeletePage => {
+                let page_idx = self.popover_page_idx.unwrap_or(self.current_page);
+                if self.document.pages.len() > 1 && page_idx < self.document.pages.len() {
+                    self.document.pages.remove(page_idx);
+                    self.selected_item_ids.clear();
+                    self.current_page = page_idx.min(self.document.pages.len().saturating_sub(1));
+                    self.popover_page_idx = None;
+                    self.popover_visible = false;
+                    self.dirty = true;
+                    self.rebuild_flow_providers();
+                }
+            }
             AppInput::RightClick(x, y) => {
                 if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
-                    self.selected_item_ids = vec![item.id.clone()];
+                    if !self.selected_item_ids.contains(&item.id) {
+                        self.selected_item_ids = vec![item.id.clone()];
+                    }
                     self.current_page = page_idx;
+                    self.popover_page_idx = Some(page_idx);
                     self.popover_pos = (x, y);
                     self.popover_visible = true;
                 } else {
-                    self.popover_visible = false;
+                    self.popover_page_idx = self.page_at_canvas_coords(x, y);
+                    if let Some(page_idx) = self.popover_page_idx {
+                        self.current_page = page_idx;
+                    }
+                    self.selected_item_ids.clear();
+                    self.popover_pos = (x, y);
+                    self.popover_visible = true;
                 }
             }
             AppInput::DoubleClick(x, y) => {
@@ -1978,7 +2510,8 @@ impl Component for AppModel {
                         let (hx, hy) = handles[5]; 
                         
                         if (local_x - hx).abs() < 2.0 && (local_y - hy).abs() < 2.0 {
-                            if let ItemContent::Text(ref tb) = item.content {
+                            if !is_in_chain(&self.document, &selected_id) {
+                                if let ItemContent::Text(ref tb) = item.content {
                                 let font_map = pangocairo::FontMap::default();
                                 let pango_ctx = font_map.create_context();
                                 pangocairo::functions::context_set_resolution(&pango_ctx, 25.4 * SCALE);
@@ -1990,6 +2523,7 @@ impl Component for AppModel {
                                 }
                                 return;
                             }
+                            }
                         }
                     }
                 }
@@ -1998,8 +2532,9 @@ impl Component for AppModel {
                     let (off_x, off_y) = self.get_page_offset(page_idx);
                     let local_x = x_mm - off_x;
                     let local_y = y_mm - off_y;
-                    let click_pos = if let ItemContent::Text(ref tb) = item.content {
-                        tb.hit_test(item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                    let click_pos = if matches!(item.content, ItemContent::Text(_)) {
+                        self.hit_test_cached(&item.id, item.x, item.y, local_x, local_y, SCALE, item.width * SCALE)
+                            .unwrap_or(0)
                     } else { 0 };
                     let id = item.id.clone();
                     let item_type = item.content.item_type();
@@ -2012,6 +2547,7 @@ impl Component for AppModel {
                             self.current_page = page_idx;
                             self.is_editing = true;
                             *self.editing_flag.borrow_mut() = true;
+                            self.invalidate_edit_layout();
                             self.request_focus = true;
 
                             if already_editing {
@@ -2067,14 +2603,14 @@ impl Component for AppModel {
 
                 if !self.is_moving && self.active_handle.is_none() {
                     if let (Some((sx, sy)), Some((cx, cy))) = (self.drag_start, self.drag_current) {
-                        let (off_x, off_y) = self.get_page_offset(self.current_page);
-
-                        let x = (sx.min(cx) / self.scale()) - off_x;
-                        let y = (sy.min(cy) / self.scale()) - off_y;
                         let width = (sx - cx).abs() / self.scale();
                         let height = (sy - cy).abs() / self.scale();
                         if width > 1.0 && height > 1.0 {
-                            if let Some(page) = self.document.pages.get_mut(self.current_page) {
+                            let page_idx = self.page_index_for_canvas_coords(sx.min(cx), sy.min(cy));
+                            let (off_x, off_y) = self.get_page_offset(page_idx);
+                            let x = (sx.min(cx) / self.scale()) - off_x;
+                            let y = (sy.min(cy) / self.scale()) - off_y;
+                            if let Some(page) = self.document.pages.get_mut(page_idx) {
                                 let new_id = uuid::Uuid::new_v4().to_string();
                                 page.items.push(Item {
                                     id: new_id.clone(),
@@ -2089,6 +2625,7 @@ impl Component for AppModel {
                                     },
                                 });
                                 self.selected_item_ids = vec![new_id];
+                                self.current_page = page_idx;
                             }
                         }
                     }
@@ -2098,19 +2635,25 @@ impl Component for AppModel {
                 self.initial_item_rects.clear();
                 self.active_handle = None;
                 self.is_moving = false;
+                if self.pending_wrap_rebuild {
+                    self.rebuild_flow_providers();
+                    self.pending_wrap_rebuild = false;
+                }
                 self.request_focus = true;
             }
             AppInput::SaveProject => {
+                let mut save_doc = self.document.clone();
+                strip_chain_downstream_texts(&mut save_doc);
                 save_project_dialog(
                     root,
                     sender.clone(),
-                    self.document.clone(),
+                    save_doc,
                     self.last_save_path.as_deref(),
                 );
             }
             AppInput::ProjectSaved(path) => {
                 self.last_save_path = Some(path);
-
+                self.dirty = false;
                 show_info_dialog(root, "Project Saved", "The project has been successfully saved.");
             }
             AppInput::OpenProject => {
@@ -2126,10 +2669,16 @@ impl Component for AppModel {
             }
             AppInput::ProjectLoaded(doc, path) => {
                 self.document = doc;
+                for root_id in collect_all_chain_roots(&self.document) {
+                    reflow_chain(&mut self.document, &root_id, SCALE, None);
+                }
                 self.last_save_path = Some(path);
+                self.dirty = false;
                 self.selected_item_ids.clear();
                 self.is_editing = false;
                 *self.editing_flag.borrow_mut() = false;
+                self.invalidate_edit_layout();
+                self.pending_wrap_rebuild = false;
                 
                 // Reset all interaction states to prevent jumps on first click
                 self.drag_start = None;
@@ -2143,6 +2692,7 @@ impl Component for AppModel {
                 self.link_drag_start = None;
                 self.link_drag_current = None;
                 self.popover_visible = false;
+                self.popover_page_idx = None;
                 self.pending_drag_start_swallows = 0;
                 self.current_page = 0;
                 
@@ -2166,26 +2716,35 @@ impl Component for AppModel {
                 self.flush_history(); // push pre-format state, close typing run
                 let mut need_enter_edit = false;
                 if let Some(id) = self.selected_item_ids.first().cloned().clone() {
+                    let range = self.selected_text_operation_range(&id, editing);
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
                                 let pos = tb.selection_range().map(|(s, _)| s).unwrap_or(tb.cursor_pos);
                                 if tb.get_attr_at(pos).bold != value {
-                                    let (s, e) = tb.selection_or_word_range();
+                                    let (s, e) = range.unwrap_or_else(|| tb.selection_or_word_range());
                                     if s < e { tb.apply_format(s, e, AttrValue::Bold(value)); }
                                 }
                             } else {
-                                let len = tb.text.len();
-                                tb.apply_format(0, len, AttrValue::Bold(value));
-                                need_enter_edit = true;
+                                if let Some((s, e)) = range {
+                                    if s < e {
+                                        tb.apply_format(s, e, AttrValue::Bold(value));
+                                        need_enter_edit = true;
+                                    }
+                                }
                             }
                         }
+                    }
+                    if is_in_chain(&self.document, &id) {
+                        let sc = self.scale();
+                        reflow_chain(&mut self.document, &id, sc, if self.is_editing { Some(id.as_str()) } else { None });
                     }
                 }
                 if need_enter_edit {
                     self.is_editing = true;
                     *self.editing_flag.borrow_mut() = true;
                 }
+                self.invalidate_edit_layout();
                 self.request_focus = true;
             }
             AppInput::SetItalic(value) => {
@@ -2194,26 +2753,35 @@ impl Component for AppModel {
                 self.flush_history(); // push pre-format state, close typing run
                 let mut need_enter_edit = false;
                 if let Some(id) = self.selected_item_ids.first().cloned().clone() {
+                    let range = self.selected_text_operation_range(&id, editing);
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
                                 let pos = tb.selection_range().map(|(s, _)| s).unwrap_or(tb.cursor_pos);
                                 if tb.get_attr_at(pos).italic != value {
-                                    let (s, e) = tb.selection_or_word_range();
+                                    let (s, e) = range.unwrap_or_else(|| tb.selection_or_word_range());
                                     if s < e { tb.apply_format(s, e, AttrValue::Italic(value)); }
                                 }
                             } else {
-                                let len = tb.text.len();
-                                tb.apply_format(0, len, AttrValue::Italic(value));
-                                need_enter_edit = true;
+                                if let Some((s, e)) = range {
+                                    if s < e {
+                                        tb.apply_format(s, e, AttrValue::Italic(value));
+                                        need_enter_edit = true;
+                                    }
+                                }
                             }
                         }
+                    }
+                    if is_in_chain(&self.document, &id) {
+                        let sc = self.scale();
+                        reflow_chain(&mut self.document, &id, sc, if self.is_editing { Some(id.as_str()) } else { None });
                     }
                 }
                 if need_enter_edit {
                     self.is_editing = true;
                     *self.editing_flag.borrow_mut() = true;
                 }
+                self.invalidate_edit_layout();
                 self.request_focus = true;
             }
             AppInput::SetUnderline(value) => {
@@ -2222,48 +2790,66 @@ impl Component for AppModel {
                 self.flush_history(); // push pre-format state, close typing run
                 let mut need_enter_edit = false;
                 if let Some(id) = self.selected_item_ids.first().cloned().clone() {
+                    let range = self.selected_text_operation_range(&id, editing);
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
                                 let pos = tb.selection_range().map(|(s, _)| s).unwrap_or(tb.cursor_pos);
                                 if tb.get_attr_at(pos).underline != value {
-                                    let (s, e) = tb.selection_or_word_range();
+                                    let (s, e) = range.unwrap_or_else(|| tb.selection_or_word_range());
                                     if s < e { tb.apply_format(s, e, AttrValue::Underline(value)); }
                                 }
                             } else {
-                                let len = tb.text.len();
-                                tb.apply_format(0, len, AttrValue::Underline(value));
-                                need_enter_edit = true;
+                                if let Some((s, e)) = range {
+                                    if s < e {
+                                        tb.apply_format(s, e, AttrValue::Underline(value));
+                                        need_enter_edit = true;
+                                    }
+                                }
                             }
                         }
+                    }
+                    if is_in_chain(&self.document, &id) {
+                        let sc = self.scale();
+                        reflow_chain(&mut self.document, &id, sc, if self.is_editing { Some(id.as_str()) } else { None });
                     }
                 }
                 if need_enter_edit {
                     self.is_editing = true;
                     *self.editing_flag.borrow_mut() = true;
                 }
+                self.invalidate_edit_layout();
                 self.request_focus = true;
             }
             AppInput::SetFontFamily(family) => {
                 let editing = self.is_editing;
                 self.flush_history(); // push pre-format state, close typing run
                 if let Some(id) = self.selected_item_ids.first().cloned().clone() {
+                    let range = self.selected_text_operation_range(&id, editing);
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
-                                let (s, e) = tb.selection_or_word_range();
+                                let (s, e) = range.unwrap_or_else(|| tb.selection_or_word_range());
                                 if s < e {
-                                    tb.apply_format(s, e, AttrValue::Family(family));
+                                    tb.apply_format(s, e, AttrValue::Family(family.clone()));
                                 }
                             } else {
-                                let len = tb.text.len();
-                                tb.apply_format(0, len, AttrValue::Family(family));
-                                self.is_editing = true;
-                                *self.editing_flag.borrow_mut() = true;
+                                if let Some((s, e)) = range {
+                                    if s < e {
+                                        tb.apply_format(s, e, AttrValue::Family(family.clone()));
+                                        self.is_editing = true;
+                                        *self.editing_flag.borrow_mut() = true;
+                                    }
+                                }
                             }
                         }
                     }
+                    if is_in_chain(&self.document, &id) {
+                        let sc = self.scale();
+                        reflow_chain(&mut self.document, &id, sc, if self.is_editing { Some(id.as_str()) } else { None });
+                    }
                 }
+                self.invalidate_edit_layout();
                 self.request_focus = true;
             }
             AppInput::SetFontSize(size) => {
@@ -2274,26 +2860,35 @@ impl Component for AppModel {
                 let editing = self.is_editing;
                 self.flush_history(); // push pre-format state, close typing run
                 if let Some(id) = self.selected_item_ids.first().cloned().clone() {
+                    let range = self.selected_text_operation_range(&id, editing);
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
                                 let pos = tb.selection_range().map(|(s, _)| s).unwrap_or(tb.cursor_pos);
                                 let current = tb.effective_snapshot_at(pos).size_pt.unwrap_or(11.0);
                                 if (size - current).abs() > 0.05 {
-                                    let (s, e) = tb.selection_or_word_range();
+                                    let (s, e) = range.unwrap_or_else(|| tb.selection_or_word_range());
                                     if s < e {
                                         tb.apply_format(s, e, AttrValue::Size(size));
                                     }
                                 }
                             } else {
-                                let len = tb.text.len();
-                                tb.apply_format(0, len, AttrValue::Size(size));
-                                self.is_editing = true;
-                                *self.editing_flag.borrow_mut() = true;
+                                if let Some((s, e)) = range {
+                                    if s < e {
+                                        tb.apply_format(s, e, AttrValue::Size(size));
+                                        self.is_editing = true;
+                                        *self.editing_flag.borrow_mut() = true;
+                                    }
+                                }
                             }
                         }
                     }
+                    if is_in_chain(&self.document, &id) {
+                        let sc = self.scale();
+                        reflow_chain(&mut self.document, &id, sc, if self.is_editing { Some(id.as_str()) } else { None });
+                    }
                 }
+                self.invalidate_edit_layout();
                 self.request_focus = true;
             }
             AppInput::SetTextAlign(align) => {
@@ -2309,39 +2904,39 @@ impl Component for AppModel {
                         }
                     }
                 }
+                self.invalidate_edit_layout();
                 self.request_focus = true;
             }
             AppInput::ClearFormat => {
                 let editing = self.is_editing;
                 self.flush_history(); // push pre-format state, close typing run
                 if let Some(id) = self.selected_item_ids.first().cloned().clone() {
+                    let range = self.selected_text_operation_range(&id, editing);
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             if editing {
-                                let (s, e) = tb.selection_or_word_range();
+                                let (s, e) = range.unwrap_or_else(|| tb.selection_or_word_range());
                                 if s < e {
                                     tb.clear_format(s, e);
                                 }
                             } else {
-                                let len = tb.text.len();
-                                tb.clear_format(0, len);
-                                self.is_editing = true;
-                                *self.editing_flag.borrow_mut() = true;
+                                if let Some((s, e)) = range {
+                                    if s < e {
+                                        tb.clear_format(s, e);
+                                        self.is_editing = true;
+                                        *self.editing_flag.borrow_mut() = true;
+                                    }
+                                }
                             }
                         }
                     }
-                }
-                self.request_focus = true;
-            }
-            AppInput::MaybeReflow(version) => {
-                if version == self.reflow_version {
-                    if let Some(id) = self.selected_item_ids.first().cloned().clone() {
-                        if is_in_chain(&self.document, &id) {
-                            let sc = self.scale();
-                            reflow_chain(&mut self.document, &id, sc);
-                        }
+                    if is_in_chain(&self.document, &id) {
+                        let sc = self.scale();
+                        reflow_chain(&mut self.document, &id, sc, if self.is_editing { Some(id.as_str()) } else { None });
                     }
                 }
+                self.invalidate_edit_layout();
+                self.request_focus = true;
             }
             AppInput::MaybeCommitHistory(version) => {
                 if version == self.undo_version {
@@ -2355,13 +2950,16 @@ impl Component for AppModel {
                 if !self.is_editing { return; }
                 self.flush_history(); // push pre-cut state, close typing run
                 if let Some(tb) = self.get_editing_text_box_mut() {
+                    tb.copy_selection();
                     tb.delete_selection();
+                    self.dirty = true;
                 }
-                // trigger reflow if in chain
-                if let Some(id) = self.selected_item_ids.first().cloned().clone() {
+                self.invalidate_edit_layout();
+
+                if let Some(id) = self.selected_item_ids.first().cloned() {
                     if is_in_chain(&self.document, &id) {
                         let sc = self.scale();
-                        reflow_chain(&mut self.document, &id, sc);
+                        reflow_chain(&mut self.document, &id, sc, Some(id.as_str()));
                     }
                 }
             }
@@ -2370,14 +2968,18 @@ impl Component for AppModel {
                 self.typing_run_active = false;
                 self.undo_version = self.undo_version.wrapping_add(1);
                 if let Some(id) = self.selected_item_ids.first().cloned().clone() {
+                    let sc = self.scale();
+                    if is_in_chain(&self.document, &id) {
+                        reflow_chain(&mut self.document, &id, sc, Some(id.as_str()));
+                    }
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             tb.undo();
                         }
                     }
+                    self.invalidate_edit_layout();
                     if is_in_chain(&self.document, &id) {
-                        let sc = self.scale();
-                        reflow_chain(&mut self.document, &id, sc);
+                        reflow_chain(&mut self.document, &id, sc, Some(id.as_str()));
                     }
                 }
             }
@@ -2386,14 +2988,18 @@ impl Component for AppModel {
                 self.typing_run_active = false;
                 self.undo_version = self.undo_version.wrapping_add(1);
                 if let Some(id) = self.selected_item_ids.first().cloned().clone() {
+                    let sc = self.scale();
+                    if is_in_chain(&self.document, &id) {
+                        reflow_chain(&mut self.document, &id, sc, Some(id.as_str()));
+                    }
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
                             tb.redo();
                         }
                     }
+                    self.invalidate_edit_layout();
                     if is_in_chain(&self.document, &id) {
-                        let sc = self.scale();
-                        reflow_chain(&mut self.document, &id, sc);
+                        reflow_chain(&mut self.document, &id, sc, Some(id.as_str()));
                     }
                 }
             }
@@ -2422,39 +3028,82 @@ impl Component for AppModel {
                             }
                         }
                         let sc = self.scale();
-                        reflow_chain(&mut self.document, &source_id, sc);
+                        reflow_chain(&mut self.document, &source_id, sc, None);
                     }
                 }
             }
             AppInput::UnlinkFrame => {
                 if let Some(id) = self.selected_item_ids.first().cloned().clone() {
-                    let (next_id, prev_id) = self.find_item(&id)
-                        .and_then(|(_, item)| {
-                            if let ItemContent::Text(tb) = &item.content {
-                                Some((tb.next_frame_id.clone(), tb.prev_frame_id.clone()))
-                            } else { None }
-                        })
-                        .unwrap_or((None, None));
+                    let sc = self.scale();
+                    if is_in_chain(&self.document, &id) {
+                        let editing_id = if self.is_editing { Some(id.as_str()) } else { None };
+                        reflow_chain(&mut self.document, &id, sc, editing_id);
+                    }
 
-                    // Disconnect selected frame from both neighbours
-                    if let Some((_, item)) = self.find_item_mut(&id) {
-                        if let ItemContent::Text(tb) = &mut item.content {
-                            tb.next_frame_id = None;
-                            tb.prev_frame_id = None;
+                    let root_id = find_chain_root(&self.document, &id);
+                    let chain = collect_chain(&self.document, &root_id);
+                    let Some(idx) = chain.iter().position(|cid| cid == &id) else { return; };
+                    if chain.len() < 2 { return; }
+
+                    let root_tb = match chain_frame_textbox(&self.document, &root_id).cloned() {
+                        Some(tb) => tb,
+                        None => return,
+                    };
+                    let current_tb = match chain_frame_textbox(&self.document, &id).cloned() {
+                        Some(tb) => tb,
+                        None => return,
+                    };
+
+                    let start = current_tb.text_offset.min(root_tb.text.len());
+                    let end = if let Some(next_id) = chain.get(idx + 1) {
+                        chain_frame_textbox(&self.document, next_id)
+                            .map(|tb| tb.text_offset.min(root_tb.text.len()))
+                            .unwrap_or(root_tb.text.len())
+                    } else {
+                        root_tb.text.len()
+                    };
+
+                    let left_ids = chain[..idx].to_vec();
+                    let right_ids = if idx + 1 < chain.len() {
+                        chain[idx + 1..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+
+                    if !left_ids.is_empty() {
+                        set_chain_links(&mut self.document, &left_ids);
+                        set_chain_frame_content(
+                            &mut self.document,
+                            &left_ids[0],
+                            root_tb.text[..start].to_string(),
+                            slice_attrs_for_range(&root_tb.attributes, 0, start),
+                            0,
+                        );
+                        if left_ids.len() >= 2 {
+                            reflow_chain(&mut self.document, &left_ids[0], sc, None);
                         }
                     }
-                    if let Some(nid) = next_id {
-                        if let Some((_, item)) = self.find_item_mut(&nid) {
-                            if let ItemContent::Text(tb) = &mut item.content {
-                                tb.prev_frame_id = None;
-                            }
-                        }
-                    }
-                    if let Some(pid) = prev_id {
-                        if let Some((_, item)) = self.find_item_mut(&pid) {
-                            if let ItemContent::Text(tb) = &mut item.content {
-                                tb.next_frame_id = None;
-                            }
+
+                    set_chain_links(&mut self.document, &[id.clone()]);
+                    set_chain_frame_content(
+                        &mut self.document,
+                        &id,
+                        root_tb.text[start..end].to_string(),
+                        slice_attrs_for_range(&root_tb.attributes, start, end),
+                        0,
+                    );
+
+                    if !right_ids.is_empty() {
+                        set_chain_links(&mut self.document, &right_ids);
+                        set_chain_frame_content(
+                            &mut self.document,
+                            &right_ids[0],
+                            root_tb.text[end..].to_string(),
+                            slice_attrs_for_range(&root_tb.attributes, end, root_tb.text.len()),
+                            0,
+                        );
+                        if right_ids.len() >= 2 {
+                            reflow_chain(&mut self.document, &right_ids[0], sc, None);
                         }
                     }
                 }
@@ -2704,6 +3353,20 @@ fn collect_chain(doc: &Document, root_id: &str) -> Vec<String> {
     chain
 }
 
+fn collect_all_chain_roots(doc: &Document) -> Vec<String> {
+    doc.pages.iter()
+        .flat_map(|p| p.items.iter())
+        .filter_map(|item| {
+            if let ItemContent::Text(tb) = &item.content {
+                if tb.prev_frame_id.is_none() && tb.next_frame_id.is_some() {
+                    return Some(item.id.clone());
+                }
+            }
+            None
+        })
+        .collect()
+}
+
 /// Returns attributes from `global_attrs` that overlap `[start, end)`,
 /// clamped and shifted so positions are relative to `start`.
 fn slice_attrs_for_range(
@@ -2725,8 +3388,96 @@ fn slice_attrs_for_range(
     out
 }
 
+fn shift_attrs(attrs: &[TextAttribute], offset: usize) -> Vec<TextAttribute> {
+    let offset = offset as u32;
+    attrs.iter().map(|attr| TextAttribute {
+        start: attr.start + offset,
+        end: attr.end + offset,
+        value: attr.value.clone(),
+    }).collect()
+}
+
+fn chain_frame_textbox<'a>(doc: &'a Document, id: &str) -> Option<&'a TextBox> {
+    doc.pages.iter()
+        .flat_map(|p| p.items.iter())
+        .find(|i| i.id == id)
+        .and_then(|item| {
+            if let ItemContent::Text(tb) = &item.content { Some(tb) } else { None }
+        })
+}
+
+fn set_chain_frame_content(
+    doc: &mut Document,
+    id: &str,
+    text: String,
+    attributes: Vec<TextAttribute>,
+    text_offset: usize,
+) {
+    if let Some(item) = doc.pages.iter_mut()
+        .flat_map(|p| p.items.iter_mut())
+        .find(|i| i.id == id)
+    {
+        if let ItemContent::Text(tb) = &mut item.content {
+            tb.text = text;
+            tb.attributes = attributes;
+            tb.text_offset = text_offset;
+            if tb.cursor_pos > tb.text.len() { tb.cursor_pos = tb.text.len(); }
+            if tb.selection_anchor.map_or(false, |a| a > tb.text.len()) {
+                tb.selection_anchor = None;
+            }
+        }
+    }
+}
+
+fn set_chain_links(doc: &mut Document, ids: &[String]) {
+    for (idx, id) in ids.iter().enumerate() {
+        let prev = idx.checked_sub(1).and_then(|i| ids.get(i)).cloned();
+        let next = ids.get(idx + 1).cloned();
+        if let Some(item) = doc.pages.iter_mut()
+            .flat_map(|p| p.items.iter_mut())
+            .find(|i| i.id == *id)
+        {
+            if let ItemContent::Text(tb) = &mut item.content {
+                tb.prev_frame_id = prev;
+                tb.next_frame_id = next;
+            }
+        }
+    }
+}
+
+fn strip_chain_downstream_texts(doc: &mut Document) {
+    for root_id in collect_all_chain_roots(doc) {
+        let chain = collect_chain(doc, &root_id);
+        for id in chain.iter().skip(1) {
+            set_chain_frame_content(doc, id, String::new(), Vec::new(), chain_frame_textbox(doc, id).map(|tb| tb.text_offset).unwrap_or(0));
+        }
+    }
+}
+
+fn collect_chain_visible_lengths(doc: &Document) -> HashMap<String, usize> {
+    let mut visible_lengths = HashMap::new();
+
+    for root_id in collect_all_chain_roots(doc) {
+        let chain = collect_chain(doc, &root_id);
+        for (idx, id) in chain.iter().enumerate() {
+            let Some(tb) = chain_frame_textbox(doc, id) else { continue; };
+            let visible_len = if let Some(next_id) = chain.get(idx + 1) {
+                chain_frame_textbox(doc, next_id)
+                    .map(|next_tb| next_tb.text_offset.saturating_sub(tb.text_offset).min(tb.text.len()))
+                    .unwrap_or(tb.text.len())
+            } else {
+                tb.text.len()
+            };
+            visible_lengths.insert(id.clone(), visible_len);
+        }
+    }
+
+    visible_lengths
+}
+
 /// Redistributes the chain's text across all linked frames.
-fn reflow_chain(doc: &mut Document, any_id: &str, scale: f64) {
+fn reflow_chain(doc: &mut Document, any_id: &str, scale: f64, editing_id: Option<&str>) {
+    let started = std::time::Instant::now();
     let root_id = find_chain_root(doc, any_id);
     let chain = collect_chain(doc, &root_id);
     if chain.len() < 2 { return; }
@@ -2749,79 +3500,135 @@ fn reflow_chain(doc: &mut Document, any_id: &str, scale: f64) {
             .unwrap_or_else(|| FrameSnap { id: id.clone(), w: 100.0, h: 100.0, tb: TextBox::default() })
     }).collect();
 
-    // Build global text and attributes from per-frame local slices
-    let mut global_text = String::new();
-    let mut global_attrs: Vec<TextAttribute> = Vec::new();
-    for snap in &snaps {
-        let offset = global_text.len() as u32;
-        global_text.push_str(&snap.tb.text);
-        for attr in &snap.tb.attributes {
-            global_attrs.push(TextAttribute {
-                start: attr.start + offset,
-                end:   attr.end   + offset,
-                value: attr.value.clone(),
-            });
+    // Priority: editing_id branch FIRST, then legacy detection.
+    // The legacy check fires whenever an edited downstream frame grows 1 byte beyond
+    // root.text, which is the normal suffix-model state while typing. If we checked
+    // legacy_layout first, it would concatenate all suffixes (N × ~500KB) and multiply
+    // the global text by the number of frames on every keystroke.
+    let (global_text, global_attrs) = if let Some(editing_id) = editing_id.filter(|id| chain.iter().any(|cid| cid == id)) {
+        if editing_id == root_id {
+            (snaps[0].tb.text.clone(), snaps[0].tb.attributes.clone())
+        } else {
+            let editing_snap = snaps.iter().find(|snap| snap.id == editing_id).unwrap();
+            let prefix_end = editing_snap.tb.text_offset.min(snaps[0].tb.text.len());
+            let mut text = snaps[0].tb.text[..prefix_end].to_string();
+            text.push_str(&editing_snap.tb.text);
+
+            let mut attrs = slice_attrs_for_range(&snaps[0].tb.attributes, 0, prefix_end);
+            attrs.extend(shift_attrs(&editing_snap.tb.attributes, prefix_end));
+            (text, attrs)
         }
-    }
+    } else {
+        // Legacy detection: old files stored slices instead of suffixes; detect by
+        // checking if any downstream frame's text extends beyond the root's text length.
+        let legacy_layout = snaps.iter().skip(1).any(|snap| {
+            !snap.tb.text.is_empty() && snaps[0].tb.text.len() < snap.tb.text_offset + snap.tb.text.len()
+        });
+        if legacy_layout {
+            let mut text = String::new();
+            let mut attrs = Vec::new();
+            for snap in &snaps {
+                let offset = text.len();
+                text.push_str(&snap.tb.text);
+                attrs.extend(shift_attrs(&snap.tb.attributes, offset));
+            }
+            (text, attrs)
+        } else {
+            (snaps[0].tb.text.clone(), snaps[0].tb.attributes.clone())
+        }
+    };
+
+    set_chain_frame_content(doc, &root_id, global_text.clone(), global_attrs.clone(), 0);
 
     // Distribute text into each frame
+    // PROBE_LIMIT: cap for probe text — well above any single-frame capacity (~4KB for A4)
+    // so measurements are accurate without allocating/copying large suffixes (500KB+).
+    const PROBE_LIMIT: usize = 15_000;
     let mut offset = 0usize;
     let n = snaps.len();
+    let mut last_frame_overflows = false;
 
     for (i, snap) in snaps.iter().enumerate() {
         let is_last = i == n - 1;
         let remaining = &global_text[offset..];
 
-        let capacity = if is_last || remaining.is_empty() {
+        let capacity = if remaining.is_empty() {
+            0
+        } else if is_last {
+            // For the last frame, also compute overflow_hint so draw_page_content
+            // doesn't have to call text_capacity again on every render cycle.
+            if remaining.len() > PROBE_LIMIT {
+                // A single frame never holds 15KB+ — definitely overflows.
+                last_frame_overflows = true;
+            } else {
+                let mut temp = snap.tb.clone();
+                temp.text = remaining.to_string();
+                temp.attributes = slice_attrs_for_range(&global_attrs, offset, global_text.len());
+                let cap = temp.text_capacity(snap.w * scale, snap.h * scale, scale);
+                last_frame_overflows = cap < remaining.len();
+            }
             remaining.len()
         } else {
-            // Build a temp TextBox with the remaining text to measure capacity
+            let probe_end = if remaining.len() <= PROBE_LIMIT {
+                remaining.len()
+            } else {
+                let mut e = PROBE_LIMIT;
+                while e > 0 && !remaining.is_char_boundary(e) { e -= 1; }
+                e
+            };
             let mut temp = snap.tb.clone();
-            temp.text = remaining.to_string();
-            temp.attributes = slice_attrs_for_range(&global_attrs, offset, global_text.len())
-                .into_iter()
-                .map(|a| TextAttribute { start: a.start, end: a.end, value: a.value })
-                .collect();
+            temp.text = remaining[..probe_end].to_string();
+            temp.attributes = slice_attrs_for_range(&global_attrs, offset, offset + probe_end);
             temp.text_capacity(snap.w * scale, snap.h * scale, scale)
         };
 
-        let frame_text  = global_text[offset..offset + capacity].to_string();
-        let frame_attrs = slice_attrs_for_range(&global_attrs, offset, offset + capacity);
-
-        if let Some(item) = doc.pages.iter_mut()
-            .flat_map(|p| p.items.iter_mut())
-            .find(|i| i.id == snap.id)
-        {
-            if let ItemContent::Text(tb) = &mut item.content {
-                tb.text_offset = offset;
-                tb.text        = frame_text;
-                tb.attributes  = frame_attrs;
-                if tb.cursor_pos > tb.text.len() { tb.cursor_pos = tb.text.len(); }
-                if tb.selection_anchor.map_or(false, |a| a > tb.text.len()) {
-                    tb.selection_anchor = None;
-                }
-            }
+        if remaining.len() > 2_000 {
+            eprintln!(
+                "[perf] reflow_chain frame id={} idx={}/{} remaining_len={} capacity={} size_mm={:.1}x{:.1}",
+                snap.id,
+                i + 1,
+                n,
+                remaining.len(),
+                capacity,
+                snap.w,
+                snap.h
+            );
         }
+
+        let frame_text = global_text[offset..].to_string();
+        let frame_attrs = slice_attrs_for_range(&global_attrs, offset, global_text.len());
+        set_chain_frame_content(doc, &snap.id, frame_text, frame_attrs, offset);
 
         offset += capacity;
-        if offset >= global_text.len() {
-            // Clear any remaining frames
-            for later in &chain[i + 1..] {
-                if let Some(item) = doc.pages.iter_mut()
-                    .flat_map(|p| p.items.iter_mut())
-                    .find(|i| &i.id == later)
-                {
-                    if let ItemContent::Text(tb) = &mut item.content {
-                        tb.text_offset = offset;
-                        tb.text.clear();
-                        tb.attributes.clear();
-                        tb.cursor_pos = 0;
-                        tb.selection_anchor = None;
-                    }
-                }
-            }
-            break;
+        if offset > global_text.len() {
+            offset = global_text.len();
         }
+    }
+
+    // Persist overflow_hint on the last frame so draw_page_content reads it O(1).
+    {
+        let last_id = snaps[n - 1].id.clone();
+        if let Some(item) = doc.pages.iter_mut()
+            .flat_map(|p| p.items.iter_mut())
+            .find(|i| i.id == last_id)
+        {
+            if let ItemContent::Text(tb) = &mut item.content {
+                tb.overflow_hint = last_frame_overflows;
+            }
+        }
+    }
+
+    let elapsed = started.elapsed();
+    if global_text.len() > 2_000 || elapsed.as_millis() >= 8 {
+        eprintln!(
+            "[perf] reflow_chain root={} frames={} global_len={} attrs={} editing_id={:?} took={}ms",
+            root_id,
+            chain.len(),
+            global_text.len(),
+            global_attrs.len(),
+            editing_id,
+            elapsed.as_millis()
+        );
     }
 }
 
@@ -2853,6 +3660,14 @@ fn selected_image_frame_has_image(doc: &Document, selected_ids: &[String]) -> bo
         }
     }
     false
+}
+
+fn next_char_boundary_local(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
 }
 
 fn get_selected_fit_mode(doc: &Document, selected_ids: &[String]) -> Option<crate::image_box::FitMode> {
@@ -2990,7 +3805,10 @@ fn draw_page_content(
     draw_handles: bool,
     scale_factor: f64,
     chain_ids: &[String],
+    visible_lengths: &HashMap<String, usize>,
     flow_providers: &HashMap<String, PrecomputedFlowProvider>,
+    editing_layout: Option<&(String, gtk::pango::Layout)>,
+    is_export: bool,
 ) {
     for item in &page.items {
         let is_selected = selected_ids.contains(&item.id);
@@ -3005,7 +3823,33 @@ fn draw_page_content(
         match &item.content {
             ItemContent::Text(tb) => {
                 let flow = flow_providers.get(&item.id).map(|p| p as &dyn crate::text_flow::TextFlowProvider);
-                tb.render(cr, pango_ctx, w, h, is_selected, is_editing_this, item.show_border, scale_factor, flow);
+                let cached_layout = if is_editing_this {
+                    editing_layout.and_then(|(id, layout)| if *id == item.id { Some(layout) } else { None })
+                } else {
+                    None
+                };
+                let visible_len = visible_lengths.get(&item.id).copied().unwrap_or(tb.text.len()).min(tb.text.len());
+                // Limit display to visible_len for ALL frames that have a successor (root + intermediate).
+                // Without this, editing such a frame shows the full suffix—content belonging to later
+                // frames—which looks like infinite repeating text. The editing case extends the window
+                // just enough to keep the cursor visible when it's past the normal frame boundary.
+                let display_len = if visible_len < tb.text.len() {
+                    if is_editing_this {
+                        tb.cursor_pos.saturating_add(200).min(tb.text.len()).max(visible_len)
+                    } else {
+                        visible_len
+                    }
+                } else {
+                    tb.text.len()
+                };
+                if display_len < tb.text.len() {
+                    let mut visible_tb = tb.clone();
+                    visible_tb.text.truncate(display_len);
+                    visible_tb.attributes = slice_attrs_for_range(&tb.attributes, 0, display_len);
+                    visible_tb.render(cr, pango_ctx, w, h, is_selected, is_editing_this, item.show_border, scale_factor, flow, None, is_export);
+                } else {
+                    tb.render(cr, pango_ctx, w, h, is_selected, is_editing_this, item.show_border, scale_factor, flow, cached_layout, is_export);
+                }
             }
             ItemContent::Image(ib) => {
                 let image = ib.image_path.as_ref()
@@ -3022,7 +3866,7 @@ fn draw_page_content(
                 sb.render(cr, w, h, is_selected, item.show_border, handle);
             }
             ItemContent::Shape => {
-                if is_selected || item.show_border {
+                if !is_export && (is_selected || item.show_border) {
                     if is_selected {
                         cr.set_source_rgb(0.0, 0.5, 1.0);
                         cr.set_line_width(2.0);
@@ -3071,68 +3915,83 @@ fn draw_page_content(
         }
 
         // Chain indicators and link-out button
-        if let ItemContent::Text(tb) = &item.content {
-            let sf = scale_factor;
-            // "flows in" indicator: green right-triangle at top-left
-            if tb.prev_frame_id.is_some() {
-                let x = item.x * sf;
-                let y = item.y * sf;
-                let s = 10.0f64;
-                cr.set_source_rgb(0.0, 0.72, 0.42);
-                cr.move_to(x, y);
-                cr.line_to(x + s, y);
-                cr.line_to(x, y + s);
-                cr.close_path();
-                cr.fill().unwrap();
-            }
-            // "flows out" indicator or link button at bottom-right
-            let w = item.width  * sf;
-            let h = item.height * sf;
-            let item_has_overflow = !tb.text.is_empty()
-                && h >= 20.0
-                && tb.required_height(pango_ctx, w, sf) > h;
+        if !is_export {
+            if let ItemContent::Text(tb) = &item.content {
+                let sf = scale_factor;
+                // "flows in" indicator: green right-triangle at top-left
+                if tb.prev_frame_id.is_some() {
+                    let x = item.x * sf;
+                    let y = item.y * sf;
+                    let s = 10.0f64;
+                    cr.set_source_rgb(0.0, 0.72, 0.42);
+                    cr.move_to(x, y);
+                    cr.line_to(x + s, y);
+                    cr.line_to(x, y + s);
+                    cr.close_path();
+                    cr.fill().unwrap();
+                }
+                // "flows out" indicator or link button at bottom-right
+                let w = item.width  * sf;
+                let h = item.height * sf;
+                let visible_len = visible_lengths.get(&item.id).copied().unwrap_or(tb.text.len()).min(tb.text.len());
+                let item_has_overflow = tb.next_frame_id.is_none()
+                    && visible_len > 0
+                    && h >= 20.0
+                    && if tb.prev_frame_id.is_some() {
+                        // Last frame in a chain — reflow_chain cached this result; avoids
+                        // calling text_capacity on every render cycle (was 6-8× per keypress).
+                        tb.overflow_hint
+                    } else if visible_len < tb.text.len() {
+                        let mut visible_tb = tb.clone();
+                        visible_tb.text.truncate(visible_len);
+                        visible_tb.attributes = slice_attrs_for_range(&tb.attributes, 0, visible_len);
+                        visible_tb.overflows_frame(pango_ctx, w, h, sf)
+                    } else {
+                        tb.overflows_frame(pango_ctx, w, h, sf)
+                    };
 
-            if tb.next_frame_id.is_some() {
-                // Already linked → orange arrow indicator next to overflow spot
-                let margin = CORNER_MARGIN_PX;
-                let size   = OVERFLOW_SIZE_PX;
-                let gap    = LINK_GAP_PX;
-                let bx = item.x * sf + w - margin - size - gap - size;
-                let by = item.y * sf + h - margin - size;
-                cr.set_source_rgb(1.0, 0.55, 0.0);
-                cr.rectangle(bx, by, size, size);
-                cr.fill().unwrap();
-                cr.set_source_rgb(1.0, 1.0, 1.0);
-                cr.set_line_width(1.2);
-                let my = by + size / 2.0;
-                cr.move_to(bx + 2.0, my);
-                cr.line_to(bx + size - 2.5, my);
-                cr.move_to(bx + size - 4.5, my - 2.0);
-                cr.line_to(bx + size - 2.5, my);
-                cr.line_to(bx + size - 4.5, my + 2.0);
-                cr.stroke().unwrap();
-            } else if item_has_overflow {
-                // Overflow, no successor → blue link button
-                let margin = CORNER_MARGIN_PX;
-                let size   = LINK_BTN_SIZE_PX;
-                let gap    = LINK_GAP_PX;
-                let ovf    = OVERFLOW_SIZE_PX;
-                let bx = item.x * sf + w - margin - ovf - gap - size;
-                let by = item.y * sf + h - margin - size;
-                cr.set_source_rgb(0.15, 0.45, 0.95);
-                cr.rectangle(bx, by, size, size);
-                cr.fill().unwrap();
-                // Chain icon: two small squares joined by a bar
-                cr.set_source_rgb(1.0, 1.0, 1.0);
-                cr.set_line_width(1.2);
-                let cy = by + size / 2.0;
-                cr.rectangle(bx + 1.5, cy - 1.5, 3.0, 3.0);
-                cr.stroke().unwrap();
-                cr.rectangle(bx + size - 4.5, cy - 1.5, 3.0, 3.0);
-                cr.stroke().unwrap();
-                cr.move_to(bx + 4.5, cy);
-                cr.line_to(bx + size - 4.5, cy);
-                cr.stroke().unwrap();
+                if tb.next_frame_id.is_some() {
+                    // Already linked → orange arrow indicator next to overflow spot
+                    let margin = CORNER_MARGIN_PX;
+                    let size   = OVERFLOW_SIZE_PX;
+                    let gap    = LINK_GAP_PX;
+                    let bx = item.x * sf + w - margin - size - gap - size;
+                    let by = item.y * sf + h - margin - size;
+                    cr.set_source_rgb(1.0, 0.55, 0.0);
+                    cr.rectangle(bx, by, size, size);
+                    cr.fill().unwrap();
+                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    cr.set_line_width(1.2);
+                    let my = by + size / 2.0;
+                    cr.move_to(bx + 2.0, my);
+                    cr.line_to(bx + size - 2.5, my);
+                    cr.move_to(bx + size - 4.5, my - 2.0);
+                    cr.line_to(bx + size - 2.5, my);
+                    cr.line_to(bx + size - 4.5, my + 2.0);
+                    cr.stroke().unwrap();
+                } else if item_has_overflow {
+                    // Overflow, no successor → blue link button
+                    let margin = CORNER_MARGIN_PX;
+                    let size   = LINK_BTN_SIZE_PX;
+                    let gap    = LINK_GAP_PX;
+                    let ovf    = OVERFLOW_SIZE_PX;
+                    let bx = item.x * sf + w - margin - ovf - gap - size;
+                    let by = item.y * sf + h - margin - size;
+                    cr.set_source_rgb(0.15, 0.45, 0.95);
+                    cr.rectangle(bx, by, size, size);
+                    cr.fill().unwrap();
+                    // Chain icon: two small squares joined by a bar
+                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    cr.set_line_width(1.2);
+                    let cy = by + size / 2.0;
+                    cr.rectangle(bx + 1.5, cy - 1.5, 3.0, 3.0);
+                    cr.stroke().unwrap();
+                    cr.rectangle(bx + size - 4.5, cy - 1.5, 3.0, 3.0);
+                    cr.stroke().unwrap();
+                    cr.move_to(bx + 4.5, cy);
+                    cr.line_to(bx + size - 4.5, cy);
+                    cr.stroke().unwrap();
+                }
             }
         }
     }
@@ -3151,14 +4010,15 @@ fn draw_canvas(
     layout: PageLayout,
     link_drag: Option<((f64, f64), (f64, f64))>,
     flow_providers: &HashMap<String, PrecomputedFlowProvider>,
+    editing_layout: Option<&(String, gtk::pango::Layout)>,
 ) {
     cr.save().unwrap();
     cr.scale(zoom, zoom);
 
-    // Set resolution for Pango to match our SCALE (3px = 1mm)
-    // 25.4 mm/inch * 3.0 px/mm = 76.2 DPI
-    let pango_ctx = pangocairo::functions::create_context(cr);
-    pangocairo::functions::context_set_resolution(&pango_ctx, 25.4 * SCALE);
+    // Build Pango layouts in document space, not from the zoomed Cairo context.
+    // Zoom should scale the final paint output only; otherwise text metrics and
+    // line breaks can shift as the viewport zoom changes.
+    let pango_ctx = make_pango_ctx();
 
     // Collect chain siblings of the selected frame so they can be highlighted
     let chain_ids: Vec<String> = selected_ids.first()
@@ -3168,6 +4028,7 @@ fn draw_canvas(
             collect_chain(doc, &root)
         })
         .unwrap_or_default();
+    let visible_lengths = collect_chain_visible_lengths(doc);
 
     let page_gap = 20.0;
     for (page_idx, page) in doc.pages.iter().enumerate() {
@@ -3200,7 +4061,7 @@ fn draw_canvas(
         cr.stroke().unwrap();
         cr.set_dash(&[], 0.0);
 
-        draw_page_content(cr, &pango_ctx, page, images, svg_handles, selected_ids, is_editing, true, SCALE, &chain_ids, flow_providers);
+        draw_page_content(cr, &pango_ctx, page, images, svg_handles, selected_ids, is_editing, true, SCALE, &chain_ids, &visible_lengths, flow_providers, editing_layout, false);
 
         cr.restore().unwrap();
     }
@@ -3258,22 +4119,53 @@ pub fn export_to_pdf(
     let surface = cairo::PdfSurface::new(width_pt, height_pt, path)?;
     let cr = cairo::Context::new(&surface)?;
 
-    // Set resolution for Pango to match our SCALE (3px = 1mm)
-    // 1 inch = 25.4 mm, so 25.4 * SCALE gives us the correct DPI for our coordinate system.
     let pango_ctx = pangocairo::functions::create_context(&cr);
     pangocairo::functions::context_set_resolution(&pango_ctx, 25.4 * SCALE);
+    let visible_lengths = collect_chain_visible_lengths(document);
 
     for page in &document.pages {
         surface.set_size(width_pt, height_pt)?;
         cr.save()?;
-        // Map our internal units (pixels at SCALE) to PDF points.
-        // 1mm = SCALE pixels in our app.
-        // 1mm = 72/25.4 points in PDF.
-        // So 1 pixel = (72/25.4) / SCALE points.
         let pdf_scale = mm_to_points / SCALE;
         cr.scale(pdf_scale, pdf_scale);
 
-        draw_page_content(&cr, &pango_ctx, page, images, svg_handles, &[], false, false, SCALE, &[], &HashMap::new());
+        // Rebuild flow providers for this page during export
+        let mut page_flow_providers = HashMap::new();
+        let scale = SCALE;
+        const FLOW_PADDING_PX: f64 = 3.0;
+        let wrap_images: Vec<&Item> = page.items.iter()
+            .filter(|it| matches!(&it.content, ItemContent::Image(ib) if ib.wrap_mode != WrapMode::Independent))
+            .collect();
+        
+        for item in &page.items {
+            if let ItemContent::Text(_) = &item.content {
+                // Check if any wrap_image overlaps with this text box
+                let overlapping: Vec<&Item> = wrap_images.iter()
+                    .filter(|img| {
+                        let overlap_x = item.x < img.x + img.width && item.x + item.width > img.x;
+                        let overlap_y = item.y < img.y + img.height && item.y + item.height > img.y;
+                        overlap_x && overlap_y
+                    })
+                    .map(|img| *img)
+                    .collect();
+
+                if !overlapping.is_empty() {
+                    let obstacles: Vec<(f64, f64, f64, f64)> = overlapping.iter()
+                        .map(|img| {
+                            ( (img.x - item.x) * scale, (img.y - item.y) * scale, img.width * scale, img.height * scale )
+                        })
+                        .collect();
+
+                    let provider = crate::text_flow::PrecomputedFlowProvider::from_rect_obstacles(
+                        (item.width * scale) as usize, (item.height * scale) as usize,
+                        &obstacles, FLOW_PADDING_PX
+                    );
+                    page_flow_providers.insert(item.id.clone(), provider);
+                }
+            }
+        }
+
+        draw_page_content(&cr, &pango_ctx, page, images, svg_handles, &[], false, false, SCALE, &[], &visible_lengths, &page_flow_providers, None, true);
 
         cr.restore()?;
         cr.show_page()?;

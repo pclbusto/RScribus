@@ -54,6 +54,29 @@ sudo apt install libgtk-4-dev libadwaita-1-dev libcairo2-dev libpango1.0-dev
    cargo run --release
    ```
 
+## App Icon
+
+RScribus now includes a square application icon source at
+`assets/icons/org.rscribus.RScribus.svg` plus a desktop entry at
+`dist/org.rscribus.RScribus.desktop`.
+
+Render the standard PNG sizes:
+
+```bash
+./scripts/render-icons.sh
+```
+
+Install the icon set and desktop launcher for the current user:
+
+```bash
+./scripts/install-desktop-assets.sh "$PWD/target/release/RScribus"
+```
+
+This installs:
+
+- `~/.local/share/icons/hicolor/.../org.rscribus.RScribus.(png|svg)`
+- `~/.local/share/applications/org.rscribus.RScribus.desktop`
+
 ## 📅 Roadmap
 
 - [ ] **Property Sidebar**: Fine-grained numerical editing for object positions and dimensions.

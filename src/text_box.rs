@@ -100,6 +100,10 @@ pub struct TextBox {
     /// Byte offset of this frame's text within the chain's global text.
     #[serde(default)]
     pub text_offset: usize,
+    /// Cached overflow flag set by reflow_chain. Avoids repeated text_capacity calls during rendering.
+    /// Only meaningful for the last frame in a chain; always false for standalone frames.
+    #[serde(skip)]
+    pub overflow_hint: bool,
     #[serde(skip)]
     pub cursor_pos: usize,
     #[serde(skip)]
@@ -124,6 +128,7 @@ impl Default for TextBox {
             next_frame_id: None,
             prev_frame_id: None,
             text_offset: 0,
+            overflow_hint: false,
             cursor_pos: 0,
             selection_anchor: None,
             scroll_y: 0.0,
@@ -607,16 +612,39 @@ impl TextBox {
 impl TextBox {
     /// Builds a Pango layout with font, width, wrapping, text attributes and alignment.
     pub fn prepare_layout(&self, pango_ctx: &pango::Context, frame_w: f64, padding: f64) -> pango::Layout {
+        let started = std::time::Instant::now();
         let pscale = pango::SCALE as f64;
         let layout = pango::Layout::new(pango_ctx);
-        layout.set_text(&self.text);
+
+        // PERFORMANCE OPTIMIZATION: Any frame in a chain only shows a portion of the
+        // text (the suffix model clips at frame bounds). We don't need Pango to layout
+        // 100k characters if we only show 500. Apply the cap to all chained frames,
+        // including the last one (prev_frame_id.is_some() without a next).
+        let (display_text, display_attrs) = if (self.next_frame_id.is_some() || self.prev_frame_id.is_some()) && self.text.len() > 5000 {
+            // Ensure we include the cursor if we are editing
+            let limit = (self.cursor_pos + 1000).max(5000).min(self.text.len());
+            let mut end = limit;
+            while end < self.text.len() && !self.text.is_char_boundary(end) { end += 1; }
+            
+            let sliced_text = &self.text[..end];
+            let sliced_attrs = build_attr_list_slice(&self.attributes, 0, end);
+            (sliced_text, Some(sliced_attrs))
+        } else {
+            (self.text.as_str(), None)
+        };
+
+        layout.set_text(display_text);
         let font_desc = pango::FontDescription::from_string(&self.font_description);
         layout.set_font_description(Some(&font_desc));
         layout.set_width(((frame_w - 2.0 * padding) * pscale) as i32);
         layout.set_wrap(pango::WrapMode::Word);
-        if !self.attributes.is_empty() {
+        
+        if let Some(attrs) = display_attrs {
+            layout.set_attributes(Some(&attrs));
+        } else if !self.attributes.is_empty() {
             layout.set_attributes(Some(&self.build_attr_list()));
         }
+
         layout.set_alignment(match self.alignment {
             TextAlign::Left   => pango::Alignment::Left,
             TextAlign::Center => pango::Alignment::Center,
@@ -624,6 +652,20 @@ impl TextBox {
         });
         if self.line_spacing != 1.0 {
             layout.set_line_spacing(self.line_spacing as f32);
+        }
+
+        let elapsed = started.elapsed();
+        if display_text.len() > 2_000 || elapsed.as_millis() >= 8 {
+            eprintln!(
+                "[perf] prepare_layout text_len={} display_len={} attrs={} linked={} width_px={:.1} padding_px={:.1} took={}ms",
+                self.text.len(),
+                display_text.len(),
+                self.attributes.len(),
+                self.next_frame_id.is_some() || self.prev_frame_id.is_some(),
+                frame_w,
+                padding,
+                elapsed.as_millis()
+            );
         }
         layout
     }
@@ -660,15 +702,50 @@ impl TextBox {
 
     /// Returns the height required to render all text at the given width.
     pub fn required_height(&self, pango_ctx: &pango::Context, w: f64, scale_factor: f64) -> f64 {
+        let started = std::time::Instant::now();
         let padding = self.padding * scale_factor;
         let layout = self.prepare_layout(pango_ctx, w, padding);
         let (_, ph) = layout.size();
-        ph as f64 / pango::SCALE as f64 + 2.0 * padding
+        let result = ph as f64 / pango::SCALE as f64 + 2.0 * padding;
+        let elapsed = started.elapsed();
+        if self.text.len() > 2_000 || elapsed.as_millis() >= 8 {
+            eprintln!(
+                "[perf] required_height text_len={} attrs={} linked={} width_px={:.1} result_px={:.1} took={}ms",
+                self.text.len(),
+                self.attributes.len(),
+                self.next_frame_id.is_some() || self.prev_frame_id.is_some(),
+                w,
+                result,
+                elapsed.as_millis()
+            );
+        }
+        result
+    }
+
+    /// Fast overflow check for non-editing render paths.
+    /// For very large texts we avoid measuring the full required height and instead
+    /// ask how much of a safe prefix would fit in the frame.
+    pub fn overflows_frame(&self, pango_ctx: &pango::Context, w: f64, h: f64, scale_factor: f64) -> bool {
+        if self.text.is_empty() {
+            return false;
+        }
+
+        if self.text.len() > 5_000 {
+            let mut probe = self.clone();
+            probe.cursor_pos = 0;
+            if probe.next_frame_id.is_none() {
+                probe.next_frame_id = Some("__overflow_probe__".to_string());
+            }
+            return probe.text_capacity(w, h, scale_factor) < self.text.len();
+        }
+
+        self.required_height(pango_ctx, w, scale_factor) > h
     }
 
     /// Returns how many bytes of `self.text` fit within the frame dimensions.
     /// Used during chain reflow to split text across linked frames.
     pub fn text_capacity(&self, w_px: f64, h_px: f64, scale: f64) -> usize {
+        let started = std::time::Instant::now();
         use pango::prelude::FontMapExt;
         if self.text.is_empty() {
             return 0;
@@ -684,6 +761,18 @@ impl TextBox {
         // Fast path: all text fits
         let (_, total_h) = layout.size();
         if total_h <= available_h_pango {
+            let elapsed = started.elapsed();
+            if self.text.len() > 2_000 || elapsed.as_millis() >= 8 {
+                eprintln!(
+                    "[perf] text_capacity text_len={} attrs={} width_px={:.1} height_px={:.1} fit_all=true capacity={} took={}ms",
+                    self.text.len(),
+                    self.attributes.len(),
+                    w_px,
+                    h_px,
+                    self.text.len(),
+                    elapsed.as_millis()
+                );
+            }
             return self.text.len();
         }
 
@@ -708,6 +797,20 @@ impl TextBox {
             last_fit_end -= 1;
         }
 
+        let elapsed = started.elapsed();
+        if self.text.len() > 2_000 || elapsed.as_millis() >= 8 {
+            eprintln!(
+                "[perf] text_capacity text_len={} attrs={} width_px={:.1} height_px={:.1} fit_all=false capacity={} lines={} took={}ms",
+                self.text.len(),
+                self.attributes.len(),
+                w_px,
+                h_px,
+                last_fit_end,
+                n_lines,
+                elapsed.as_millis()
+            );
+        }
+
         last_fit_end
     }
 
@@ -726,6 +829,8 @@ impl TextBox {
         show_border: bool,
         scale_factor: f64,
         flow: Option<&dyn TextFlowProvider>,
+        prepared_layout: Option<&pango::Layout>,
+        is_export: bool,
     ) {
         let padding = self.padding * scale_factor;
 
@@ -735,7 +840,7 @@ impl TextBox {
             cr.fill().unwrap();
         }
 
-        if is_selected || show_border {
+        if (is_selected || show_border) && !is_export {
             if is_selected {
                 cr.set_source_rgb(0.0, 0.5, 1.0);
                 cr.set_line_width(2.0);
@@ -758,7 +863,8 @@ impl TextBox {
         cr.clip();
         cr.translate(0.0, -self.scroll_y);
 
-        let layout = self.prepare_layout(pango_ctx, w, padding);
+        let layout = prepared_layout.cloned()
+            .unwrap_or_else(|| self.prepare_layout(pango_ctx, w, padding));
         let pscale = pango::SCALE as f64;
 
         if is_editing {
@@ -801,8 +907,18 @@ impl TextBox {
 
         cr.restore().unwrap();
 
-        if !is_editing && !self.text.is_empty() && h >= 20.0 {
-            if self.required_height(pango_ctx, w, scale_factor) > h {
+        if !is_export
+            && !is_editing
+            && !self.text.is_empty()
+            && h >= 20.0
+            && self.next_frame_id.is_none()
+        {
+            let overflows = if self.prev_frame_id.is_some() {
+                self.overflow_hint
+            } else {
+                self.overflows_frame(pango_ctx, w, h, scale_factor)
+            };
+            if overflows {
                 draw_overflow_indicator(cr, w, h);
             }
         }

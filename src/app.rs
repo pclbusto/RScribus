@@ -3218,6 +3218,18 @@ impl AppModel {
                     cr.set_operator(cairo::Operator::DestOut);
 
                     for (img, rel_x, rel_y, iw, ih) in &overlapping {
+                        let wrap_mode = match &img.content {
+                            ItemContent::Image(ib) => ib.wrap_mode,
+                            _ => continue,
+                        };
+
+                        if wrap_mode == WrapMode::Block {
+                            cr.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+                            cr.rectangle(0.0, *rel_y, fw_f, *ih);
+                            cr.fill().unwrap();
+                            continue;
+                        }
+
                         let surf_opt = if let ItemContent::Image(ib) = &img.content {
                             ib.image_path.as_deref().and_then(|p| self.image_surfaces.get(p))
                         } else {
@@ -4150,15 +4162,73 @@ pub fn export_to_pdf(
                     .collect();
 
                 if !overlapping.is_empty() {
-                    let obstacles: Vec<(f64, f64, f64, f64)> = overlapping.iter()
-                        .map(|img| {
-                            ( (img.x - item.x) * scale, (img.y - item.y) * scale, img.width * scale, img.height * scale )
-                        })
-                        .collect();
+                    let fw_f = item.width * scale;
+                    let fh_f = item.height * scale;
+                    let fw = fw_f as i32 + 1;
+                    let fh = fh_f as i32 + 1;
+                    let Ok(mut mask_surf) = cairo::ImageSurface::create(cairo::Format::A8, fw, fh)
+                    else { continue };
 
-                    let provider = crate::text_flow::PrecomputedFlowProvider::from_rect_obstacles(
-                        (item.width * scale) as usize, (item.height * scale) as usize,
-                        &obstacles, FLOW_PADDING_PX
+                    {
+                        let Ok(cr) = cairo::Context::new(&mask_surf) else { continue };
+                        cr.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+                        cr.paint().unwrap();
+                        cr.set_operator(cairo::Operator::DestOut);
+
+                        for img in &overlapping {
+                            let (wrap_mode, image_path) = match &img.content {
+                                ItemContent::Image(ib) => (ib.wrap_mode, ib.image_path.as_deref()),
+                                _ => continue,
+                            };
+
+                            let rel_x = (img.x - item.x) * scale;
+                            let rel_y = (img.y - item.y) * scale;
+                            let iw = img.width * scale;
+                            let ih = img.height * scale;
+
+                            if wrap_mode == WrapMode::Block {
+                                cr.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+                                cr.rectangle(0.0, rel_y, fw_f, ih);
+                                cr.fill().unwrap();
+                                continue;
+                            }
+
+                            let surf_opt = image_path.and_then(|p| images.get(p));
+
+                            cr.save().unwrap();
+                            cr.translate(rel_x, rel_y);
+
+                            if let Some(surf_rc) = surf_opt {
+                                let src_w = surf_rc.width() as f64;
+                                let src_h = surf_rc.height() as f64;
+                                if src_w > 0.0 && src_h > 0.0 {
+                                    cr.scale(iw / src_w, ih / src_h);
+                                    cr.set_source_surface(&**surf_rc, 0.0, 0.0).unwrap();
+                                    cr.paint().unwrap();
+                                }
+                            } else {
+                                cr.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+                                cr.rectangle(0.0, 0.0, iw, ih);
+                                cr.fill().unwrap();
+                            }
+                            cr.restore().unwrap();
+                        }
+                    }
+
+                    let stride = mask_surf.stride() as usize;
+                    let fw_usize = fw as usize;
+                    let fh_usize = fh as usize;
+                    let flat = {
+                        let Ok(data) = mask_surf.data() else { continue };
+                        let mut v = Vec::with_capacity(fw_usize * fh_usize);
+                        for row in 0..fh_usize {
+                            v.extend_from_slice(&data[row * stride..row * stride + fw_usize]);
+                        }
+                        v
+                    };
+
+                    let provider = crate::text_flow::PrecomputedFlowProvider::from_a8_mask(
+                        &flat, fw_usize, fh_usize, FLOW_PADDING_PX,
                     );
                     page_flow_providers.insert(item.id.clone(), provider);
                 }

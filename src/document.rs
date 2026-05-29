@@ -9,10 +9,21 @@ pub struct Document {
     pub pages: Vec<Page>,
     pub width: f64,
     pub height: f64,
+    #[serde(default)]
+    pub master_pages: Vec<MasterPage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page {
+    pub items: Vec<Item>,
+    #[serde(default)]
+    pub master_page: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MasterPage {
+    pub id: String,
+    pub name: String,
     pub items: Vec<Item>,
 }
 
@@ -38,6 +49,56 @@ pub enum ItemContent {
     Image(ImageBox),
     Svg(SvgBox),
     Shape,
+}
+
+impl Item {
+    pub fn empty_clone(&self) -> Self {
+        Item {
+            id: String::new(),
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            rotation: self.rotation,
+            show_border: self.show_border,
+            content: self.content.empty_clone(),
+        }
+    }
+}
+
+impl ItemContent {
+    pub fn empty_clone(&self) -> Self {
+        match self {
+            ItemContent::Text(tb) => {
+                let mut empty = TextBox::default();
+                empty.font_description = tb.font_description.clone();
+                empty.padding = tb.padding;
+                empty.line_spacing = tb.line_spacing;
+                empty.alignment = tb.alignment;
+                ItemContent::Text(empty)
+            }
+            ItemContent::Image(_) => ItemContent::Image(ImageBox::default()),
+            ItemContent::Svg(_) => ItemContent::Svg(SvgBox::default()),
+            ItemContent::Shape => ItemContent::Shape,
+        }
+    }
+}
+
+impl MasterPage {
+    pub fn from_page(name: String, page: &Page) -> Self {
+        let items: Vec<Item> = page.items.iter()
+            .map(|item| {
+                let mut c = item.clone();
+                c.id = uuid::Uuid::new_v4().to_string();
+                c
+            })
+            .collect();
+        MasterPage {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            items,
+        }
+    }
 }
 
 impl ItemContent {
@@ -77,10 +138,12 @@ impl Default for Document {
                             content: ItemContent::Text(TextBox::new("Sample text for the first frame.".to_string())),
                         }
                     ],
+                    master_page: None,
                 }
             ],
             width: 210.0,
             height: 297.0,
+            master_pages: Vec::new(),
         }
     }
 }
@@ -89,6 +152,7 @@ impl Default for Page {
     fn default() -> Self {
         Self {
             items: Vec::new(),
+            master_page: None,
         }
     }
 }

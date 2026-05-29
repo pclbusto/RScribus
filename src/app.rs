@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use crate::app_dialogs::{show_info_dialog, show_keyboard_shortcuts_window};
 use crate::app_io::{export_pdf_dialog, open_project_dialog, save_project_dialog, show_preferences_dialog};
-use crate::document::{Document, Item, ItemContent, ItemType};
+use crate::document::{Document, Item, ItemContent, ItemType, MasterPage};
 use crate::text_box::{TextBox, KeyAction, AttrValue, AttrSnapshot, TextAlign, TextAttribute};
 use crate::image_box::{FitMode, ImageBox, WrapMode};
 use crate::svg_box::SvgBox;
@@ -20,11 +20,26 @@ pub enum PageLayout {
     Horizontal,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AlignH { Left, Center, Right }
+
+#[derive(Debug, Clone, Copy)]
+enum AlignV { Top, Center, Bottom }
+
 struct EditLayoutCache {
     item_id: String,
     frame_w_px: f64,
     padding_px: f64,
     layout: gtk::pango::Layout,
+}
+
+#[derive(Hash, Eq, PartialEq)]
+struct LayoutCacheKey {
+    item_id: String,
+    w_bits: u64,
+    h_bits: u64,
+    display_len: usize,
+    reflow_version: u64,
 }
 
 pub struct AppModel {
@@ -81,7 +96,22 @@ pub struct AppModel {
     show_sidebar: bool,
     dirty: bool,
     edit_layout_cache: Option<EditLayoutCache>,
+    render_layout_cache: Rc<RefCell<HashMap<LayoutCacheKey, gtk::pango::Layout>>>,
     pending_wrap_rebuild: bool,
+    /// Master page editing mode: when true, pages[0] temporarily holds a master page's items.
+    master_page_mode: bool,
+    /// Which master page is currently loaded into pages[0] for editing.
+    selected_master_page_id: Option<String>,
+    /// Saved page-0 items while editing a master page; restored on exit.
+    saved_page_0_items: Option<Vec<Item>>,
+    /// Alignment-reference item ID (None = page).
+    alignment_ref_id: Option<String>,
+    pick_alignment_ref: bool,
+    alignment_mode: bool,
+    fit_message: Option<String>,
+    /// Text displayed in the font-family entry.  Updated by the font dialog or
+    /// when the cursor moves to a text position with a different family.
+    font_entry_value: String,
 }
 
 impl AppModel {
@@ -135,17 +165,10 @@ impl AppModel {
 
     fn invalidate_edit_layout(&mut self) {
         self.edit_layout_cache = None;
-    }
-
-    fn page_index_for_canvas_coords(&self, x_px: f64, y_px: f64) -> usize {
-        let x_mm = x_px / self.scale();
-        let y_mm = y_px / self.scale();
-        let page_gap = 20.0;
-        let idx = match self.page_layout {
-            PageLayout::Vertical => (y_mm / (self.document.height + page_gap)).floor() as i32,
-            PageLayout::Horizontal => (x_mm / (self.document.width + page_gap)).floor() as i32,
-        };
-        (idx.max(0) as usize).min(self.document.pages.len().saturating_sub(1))
+        if let Some(id) = self.selected_item_ids.first() {
+            let id = id.clone();
+            self.render_layout_cache.borrow_mut().retain(|k, _| k.item_id != id);
+        }
     }
 
     fn page_at_canvas_coords(&self, x_px: f64, y_px: f64) -> Option<usize> {
@@ -166,6 +189,17 @@ impl AppModel {
         }
 
         None
+    }
+
+    fn page_index_for_canvas_coords(&self, x_px: f64, y_px: f64) -> usize {
+        let x_mm = x_px / self.scale();
+        let y_mm = y_px / self.scale();
+        let page_gap = 20.0;
+        let idx = match self.page_layout {
+            PageLayout::Vertical => (y_mm / (self.document.height + page_gap)).floor() as i32,
+            PageLayout::Horizontal => (x_mm / (self.document.width + page_gap)).floor() as i32,
+        };
+        (idx.max(0) as usize).min(self.document.pages.len().saturating_sub(1))
     }
 
     fn refresh_cursor_snapshot(&mut self) {
@@ -750,6 +784,7 @@ pub enum AppInput {
     ClearFormat,
     LinkTo(String),
     UnlinkFrame,
+    SplitChainHere,
     SetWrapMode(WrapMode),
     SetShowBorder(bool),
     Undo,
@@ -766,6 +801,26 @@ pub enum AppInput {
     NewProjectConfirmed,
     MaybeReflow(u64),
     DeletePage,
+    CreateMasterPage,
+    ApplyMasterPage(String),
+    RenameMasterPage(String, String),
+    RemoveMasterPageFromPage,
+    DeleteMasterPage(String),
+    EnterMasterPageMode(String),
+    ExitMasterPageMode,
+    NewMasterPage,
+    AlignLeft,
+    AlignCenterH,
+    AlignRight,
+    AlignTop,
+    AlignCenterV,
+    AlignBottom,
+    StartPickAlignmentRef,
+    SetAlignmentRef(String),
+    EnterAlignmentMode,
+    ExitAlignmentMode,
+    FitPageToWindow,
+    ClearFitMessage,
 }
 
 #[derive(Debug)]
@@ -782,6 +837,16 @@ impl Component for AppModel {
         adw::ApplicationWindow {
             set_default_size: (1000, 700),
             set_visible: true,
+
+            add_controller = gtk::EventControllerKey {
+                connect_key_pressed[sender] => move |_ctrl, keyval, _keycode, state| {
+                    if state.contains(gdk::ModifierType::CONTROL_MASK) && keyval == gdk::Key::f {
+                        sender.input(AppInput::FitPageToWindow);
+                        return gtk::glib::Propagation::Stop;
+                    }
+                    gtk::glib::Propagation::Proceed
+                },
+            },
 
             #[wrap(Some)]
             set_content = &gtk::Box {
@@ -891,11 +956,75 @@ impl Component for AppModel {
                         gtk::Separator {},
                         gtk::Label {
                             #[watch]
-                            set_label: &format!("Pages: {}", model.document.pages.len()),
+                            set_label: &{
+                                if let Some(ref msg) = model.fit_message {
+                                    msg.clone()
+                                } else if model.master_page_mode {
+                                    model.document.master_pages.iter()
+                                        .find(|m| m.id == *model.selected_master_page_id.as_deref().unwrap_or(""))
+                                        .map(|m| format!("Master: {}", m.name))
+                                        .unwrap_or_else(|| "Master: —".to_string())
+                                } else {
+                                    format!("Pages: {}", model.effective_page_count())
+                                }
+                            },
                         },
                         gtk::Label {
                             #[watch]
                             set_label: &format!("Size: {}x{}mm", model.document.width, model.document.height),
+                        },
+                        gtk::Separator {},
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 4,
+                            add_css_class: "linked",
+                            gtk::ToggleButton {
+                                set_label: "Pages",
+                                #[watch]
+                                set_active: !model.master_page_mode,
+                                connect_toggled[sender] => move |btn| {
+                                    if btn.is_active() {
+                                        sender.input(AppInput::ExitMasterPageMode);
+                                    }
+                                },
+                            },
+                            gtk::ToggleButton {
+                                set_label: "Masters",
+                                #[watch]
+                                set_active: model.master_page_mode,
+                                connect_toggled[sender] => move |btn| {
+                                    if btn.is_active() {
+                                        sender.input(AppInput::EnterMasterPageMode(String::new()));
+                                    }
+                                },
+                            },
+                        },
+                        gtk::Separator {},
+                        gtk::Label {
+                            set_label: "Master Pages",
+                            add_css_class: "heading",
+                            set_xalign: 0.0,
+                        },
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 4,
+                            gtk::Button {
+                                set_label: "New",
+                                set_tooltip_text: Some("Create blank master page"),
+                                add_css_class: "flat",
+                                connect_clicked => AppInput::NewMasterPage,
+                            },
+                            gtk::Button {
+                                set_label: "From page",
+                                set_tooltip_text: Some("Create master page from current page layout"),
+                                add_css_class: "flat",
+                                connect_clicked => AppInput::CreateMasterPage,
+                            },
+                        },
+                        #[name = "master_pages_listbox"]
+                        gtk::ListBox {
+                            add_css_class: "rich-list",
+                            set_selection_mode: gtk::SelectionMode::None,
                         },
                         gtk::Separator {},
                         gtk::Label {
@@ -1012,18 +1141,33 @@ impl Component for AppModel {
                                 },
                             },
                         },
-                        gtk::Entry {
-                            set_placeholder_text: Some("Fuente"),
-                            set_tooltip_text: Some("Familia de fuente (Enter para aplicar)"),
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 4,
                             #[watch]
                             set_visible: model.selected_item_type() == Some(ItemType::TextFrame),
-                            #[watch]
-                            set_text: model.cursor_snapshot.family.as_deref().unwrap_or(""),
-                            connect_activate[sender] => move |entry| {
-                                let f = entry.text().to_string();
-                                if !f.is_empty() {
-                                    sender.input(AppInput::SetFontFamily(f));
-                                }
+                            gtk::Entry {
+                                set_placeholder_text: Some("Font family"),
+                                #[watch]
+                                set_text: &model.font_entry_value,
+                                set_hexpand: true,
+                                connect_activate[sender] => move |entry| {
+                                    let f = entry.text().to_string();
+                                    if !f.is_empty() {
+                                        sender.input(AppInput::SetFontFamily(f));
+                                    }
+                                },
+                            },
+                            gtk::Button {
+                                set_icon_name: "preferences-desktop-font-symbolic",
+                                set_tooltip_text: Some("Choose font..."),
+                                add_css_class: "flat",
+                                connect_clicked[sender, root] => move |_| {
+                                    // Use our custom font dialog that can distinguish
+                                    // optical-size variants (e.g. EB Garamond 12 vs 08)
+                                    // which GTK4 FontDialog cannot expose.
+                                    show_custom_font_dialog(&root, sender.clone());
+                                },
                             },
                         },
                         gtk::Box {
@@ -1113,7 +1257,138 @@ impl Component for AppModel {
                             set_visible: model.selected_item_type() == Some(ItemType::SvgFrame),
                             connect_clicked => AppInput::ImportSvg,
                         },
-                    },
+                        gtk::Separator {
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                        },
+                        gtk::Label {
+                            set_label: "Alignment",
+                            add_css_class: "title-4",
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                        },
+                        gtk::Label {
+                            #[watch]
+                            set_label: &{
+                                if let Some(ref ref_id) = model.alignment_ref_id {
+                                    let mut found: Option<&crate::document::Item> = None;
+                                    for page in &model.document.pages {
+                                        if let Some(item) = page.items.iter().find(|i| &i.id == ref_id) {
+                                            found = Some(item);
+                                            break;
+                                        }
+                                    }
+                                    if let Some(item) = found {
+                                        format!("Reference: {}", item.id.chars().take(6).collect::<String>())
+                                    } else {
+                                        "Reference: Page".to_string()
+                                    }
+                                } else {
+                                    "Reference: Page".to_string()
+                                }
+                            },
+                            add_css_class: "caption",
+                            set_xalign: 0.0,
+                            set_ellipsize: gtk::pango::EllipsizeMode::End,
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                        },
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 4,
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                            gtk::Button {
+                                set_label: "Pick reference",
+                                set_tooltip_text: Some("Click an item on the canvas to use as alignment reference"),
+                                connect_clicked[sender] => move |_| {
+                                    sender.input(AppInput::StartPickAlignmentRef);
+                                },
+                            },
+                            gtk::Button {
+                                set_label: "Page",
+                                set_tooltip_text: Some("Use page as reference"),
+                                connect_clicked => AppInput::SetAlignmentRef(String::new()),
+                            },
+                        },
+                        gtk::Separator {
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                        },
+                        gtk::Label {
+                            set_label: "Horizontal",
+                            add_css_class: "heading",
+                            set_xalign: 0.0,
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                        },
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 4,
+                            add_css_class: "linked",
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                            gtk::Button {
+                                set_label: "Left",
+                                set_tooltip_text: Some("Align left edges"),
+                                connect_clicked => AppInput::AlignLeft,
+                            },
+                            gtk::Button {
+                                set_label: "Center",
+                                set_tooltip_text: Some("Align horizontal centers"),
+                                connect_clicked => AppInput::AlignCenterH,
+                            },
+                            gtk::Button {
+                                set_label: "Right",
+                                set_tooltip_text: Some("Align right edges"),
+                                connect_clicked => AppInput::AlignRight,
+                            },
+                        },
+                        gtk::Separator {
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                        },
+                        gtk::Label {
+                            set_label: "Vertical",
+                            add_css_class: "heading",
+                            set_xalign: 0.0,
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                        },
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Horizontal,
+                            set_spacing: 4,
+                            add_css_class: "linked",
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                            gtk::Button {
+                                set_label: "Top",
+                                set_tooltip_text: Some("Align top edges"),
+                                connect_clicked => AppInput::AlignTop,
+                            },
+                            gtk::Button {
+                                set_label: "Center",
+                                set_tooltip_text: Some("Align vertical centers"),
+                                connect_clicked => AppInput::AlignCenterV,
+                            },
+                            gtk::Button {
+                                set_label: "Bottom",
+                                set_tooltip_text: Some("Align bottom edges"),
+                                connect_clicked => AppInput::AlignBottom,
+                            },
+                        },
+                        gtk::Separator {
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                        },
+                        gtk::Button {
+                            set_label: "Close alignment",
+                            set_tooltip_text: Some("Return to normal mode"),
+                            #[watch]
+                            set_visible: model.alignment_mode,
+                            connect_clicked => AppInput::ExitAlignmentMode,
+                                    },
+                                },
 
                     #[name = "scrolled_window"]
                     #[wrap(Some)]
@@ -1142,11 +1417,22 @@ impl Component for AppModel {
                                         (w * model.scale()) as i32
                                     },
                                     #[watch]
+                                    set_content_width: {
+                                        let page_gap = 20.0;
+                                        let w = match model.page_layout {
+                                            PageLayout::Horizontal => {
+                                                model.effective_page_count() as f64 * model.document.width + (model.effective_page_count().saturating_sub(1) as f64) * page_gap
+                                            }
+                                            PageLayout::Vertical => model.document.width,
+                                        };
+                                        (w * model.scale()) as i32
+                                    },
+                                    #[watch]
                                     set_content_height: {
                                         let page_gap = 20.0;
                                         let h = match model.page_layout {
                                             PageLayout::Vertical => {
-                                                model.document.pages.len() as f64 * model.document.height + (model.document.pages.len().saturating_sub(1) as f64) * page_gap
+                                                model.effective_page_count() as f64 * model.document.height + (model.effective_page_count().saturating_sub(1) as f64) * page_gap
                                             }
                                             PageLayout::Horizontal => model.document.height,
                                         };
@@ -1172,8 +1458,11 @@ impl Component for AppModel {
                                         let flow_providers = model.flow_providers.clone();
                                         let editing_layout = model.edit_layout_cache.as_ref()
                                             .map(|cache| (cache.item_id.clone(), cache.layout.clone()));
+                                        let render_cache = Rc::clone(&model.render_layout_cache);
+                                        let reflow_version = model.reflow_version;
+                                        let master_mode = model.master_page_mode && model.selected_master_page_id.is_some();
                                         move |_area, cr, _w, _h| {
-                                            draw_canvas(cr, &doc, d_start, d_current, &selected, editing, &images, &svgs, zoom, layout, link_drag, &flow_providers, editing_layout.as_ref());
+                                            draw_canvas(cr, &doc, d_start, d_current, &selected, editing, &images, &svgs, zoom, layout, link_drag, &flow_providers, editing_layout.as_ref(), &render_cache, reflow_version, master_mode);
                                         }
                                     },
 
@@ -1255,6 +1544,43 @@ impl Component for AppModel {
                                                 && model.popover_page_idx.is_some(),
                                             connect_clicked => AppInput::DeletePage,
                                         },
+                                        gtk::Label {
+                                            #[watch]
+                                            set_label: &{
+                                                let page_idx = model.popover_page_idx.unwrap_or(model.current_page);
+                                                model.document.pages.get(page_idx)
+                                                    .and_then(|p| p.master_page.as_deref())
+                                                    .and_then(|mid| model.document.master_pages.iter().find(|m| m.id == *mid))
+                                                    .map(|m| format!("Master: {}", m.name))
+                                                    .unwrap_or_default()
+                                            },
+                                            #[watch]
+                                            set_visible: model.selected_item_ids.is_empty()
+                                                && model.popover_page_idx.is_some()
+                                                && !model.document.master_pages.is_empty(),
+                                            add_css_class: "caption",
+                                            set_xalign: 0.0,
+                                        },
+                                        gtk::Button {
+                                            set_label: "Convertir a página maestra",
+                                            #[watch]
+                                            set_visible: model.selected_item_ids.is_empty()
+                                                && model.popover_page_idx.is_some(),
+                                            connect_clicked => AppInput::CreateMasterPage,
+                                        },
+                                        gtk::Button {
+                                            set_label: "Quitar página maestra",
+                                            #[watch]
+                                            set_visible: model.selected_item_ids.is_empty()
+                                                && model.popover_page_idx.is_some()
+                                                && {
+                                                    let page_idx = model.popover_page_idx.unwrap_or(model.current_page);
+                                                    model.document.pages.get(page_idx)
+                                                        .map(|p| p.master_page.is_some())
+                                                        .unwrap_or(false)
+                                                },
+                                            connect_clicked => AppInput::RemoveMasterPageFromPage,
+                                        },
                                         gtk::Separator {
                                             #[watch]
                                             set_visible: model.selected_item_ids.is_empty()
@@ -1280,6 +1606,12 @@ impl Component for AppModel {
                                             #[watch]
                                             set_visible: is_selected_type(&model.document, &model.selected_item_ids, &ItemType::TextFrame),
                                             connect_clicked => AppInput::StartEdit,
+                                        },
+                                        gtk::Button {
+                                            set_label: "Dividir cadena aquí",
+                                            #[watch]
+                                            set_visible: selected_text_frame_has_next_chain(&model.document, &model.selected_item_ids, model.is_editing),
+                                            connect_clicked => AppInput::SplitChainHere,
                                         },
 
                                         // ImageFrame actions
@@ -1508,6 +1840,17 @@ impl Component for AppModel {
                                             #[watch]
                                             set_visible: !model.selected_item_ids.is_empty(),
                                         },
+                                        gtk::Button {
+                                            set_label: "Align...",
+                                            set_tooltip_text: Some("Open alignment panel in sidebar"),
+                                            #[watch]
+                                            set_visible: !model.selected_item_ids.is_empty(),
+                                            connect_clicked => AppInput::EnterAlignmentMode,
+                                        },
+                                        gtk::Separator {
+                                            #[watch]
+                                            set_visible: !model.selected_item_ids.is_empty(),
+                                        },
                                         gtk::Label {
                                             set_label: "Z-Order",
                                             add_css_class: "heading",
@@ -1598,7 +1941,16 @@ impl Component for AppModel {
             show_sidebar: true,
             dirty: false,
             edit_layout_cache: None,
+            render_layout_cache: Rc::new(RefCell::new(HashMap::new())),
             pending_wrap_rebuild: false,
+            master_page_mode: false,
+            selected_master_page_id: None,
+            saved_page_0_items: None,
+            alignment_ref_id: None,
+            pick_alignment_ref: false,
+            alignment_mode: false,
+            fit_message: None,
+            font_entry_value: String::new(),
         };
 
         let widgets = view_output!();
@@ -1614,9 +1966,35 @@ impl Component for AppModel {
     ) {
         let is_project_loaded = matches!(message, AppInput::ProjectLoaded(..));
 
+        let prev_snapshot_family = self.cursor_snapshot.family.clone();
+        let prev_selected = self.selected_item_ids.clone();
+
         self.update(message.clone(), sender.clone(), root);
         self.refresh_cursor_snapshot();
+
+        // Update the font entry whenever the cursor moves to a different family
+        // or when the user switches text frames, but not when a format command
+        // (SetFontFamily / SetFontSize / etc.) was just applied — those handlers
+        // set font_entry_value explicitly themselves.
+        let is_format_cmd = matches!(
+            message,
+            AppInput::SetFontFamily(_) |
+            AppInput::SetFontSize(_) |
+            AppInput::SetBold(_) |
+            AppInput::SetItalic(_) |
+            AppInput::SetUnderline(_) |
+            AppInput::ClearFormat
+        );
+        if !is_format_cmd {
+            let family_changed = self.cursor_snapshot.family != prev_snapshot_family;
+            let selection_changed = self.selected_item_ids != prev_selected;
+            if family_changed || selection_changed {
+                self.font_entry_value = self.cursor_snapshot.family.clone().unwrap_or_default();
+            }
+        }
+
         self.update_view(widgets, sender.clone());
+        rebuild_master_pages_ui(&self, &mut widgets.master_pages_listbox, sender.clone());
 
         // Autoscroll logic
         if matches!(message, AppInput::DragUpdate(..) | AppInput::Autoscroll) {
@@ -2107,6 +2485,10 @@ impl Component for AppModel {
                                 sender.input(AppInput::AddPage);
                                 return;
                             }
+                            gdk::Key::f | gdk::Key::F => {
+                                sender.input(AppInput::FitPageToWindow);
+                                return;
+                            }
                             gdk::Key::n | gdk::Key::N => {
                                 sender.input(AppInput::NewProject);
                                 return;
@@ -2152,6 +2534,10 @@ impl Component for AppModel {
                 // Global shortcuts that should work even when editing
                 if ctrl {
                     match key {
+                        gdk::Key::f | gdk::Key::F => {
+                            sender.input(AppInput::FitPageToWindow);
+                            return;
+                        }
                         gdk::Key::n | gdk::Key::N => {
                             sender.input(AppInput::NewProject);
                             return;
@@ -2265,6 +2651,17 @@ impl Component for AppModel {
                 if will_modify {
                     self.schedule_history_commit(&sender);
                     self.invalidate_edit_layout();
+
+                    // Immediately reflow chained frames so downstream frames
+                    // update live during typing (backspace, delete, typing, return).
+                    let chained_id = self.selected_item_ids.first().cloned();
+                    if let Some(ref id) = chained_id {
+                        if is_in_chain(&self.document, id) {
+                            let sc = self.scale();
+                            reflow_chain(&mut self.document, id, sc, Some(id.as_str()));
+                            self.reflow_version = self.reflow_version.wrapping_add(1);
+                        }
+                    }
                 }
 
                 let item_dims = self.selected_item_ids.first()
@@ -2301,6 +2698,17 @@ impl Component for AppModel {
             }
             AppInput::DragStart(x, y, state) => {
                 if !self.canvas_ready { return; }
+
+                if self.pick_alignment_ref {
+                    if let Some((_, item)) = self.hit_test_all_pages(x, y) {
+                        self.alignment_ref_id = Some(item.id.clone());
+                    } else {
+                        self.alignment_ref_id = None;
+                    }
+                    self.pick_alignment_ref = false;
+                    return;
+                }
+
                 // Swallow the click that dismissed a popover so it doesn't
                 // accidentally move items or change current_page.
                 if self.pending_drag_start_swallows > 0 {
@@ -2475,7 +2883,160 @@ impl Component for AppModel {
                     self.rebuild_flow_providers();
                 }
             }
+            AppInput::CreateMasterPage => {
+                let page = &self.document.pages[self.current_page];
+                let name = format!("Master Page {}", self.document.master_pages.len() + 1);
+                let mp = MasterPage::from_page(name, page);
+                self.document.master_pages.push(mp);
+                self.dirty = true;
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::ApplyMasterPage(mp_id) => {
+                if let Some(page) = self.document.pages.get_mut(self.current_page) {
+                    page.master_page = Some(mp_id);
+                }
+                self.dirty = true;
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::RenameMasterPage(mp_id, new_name) => {
+                if let Some(mp) = self.document.master_pages.iter_mut().find(|m| m.id == mp_id) {
+                    mp.name = new_name;
+                }
+                self.dirty = true;
+            }
+            AppInput::RemoveMasterPageFromPage => {
+                if let Some(page) = self.document.pages.get_mut(self.current_page) {
+                    page.master_page = None;
+                }
+                self.dirty = true;
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::DeleteMasterPage(mp_id) => {
+                self.document.master_pages.retain(|m| m.id != mp_id);
+                // Clear reference on all pages using this master
+                for page in &mut self.document.pages {
+                    if page.master_page.as_deref() == Some(&mp_id) {
+                        page.master_page = None;
+                    }
+                }
+                self.dirty = true;
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::EnterMasterPageMode(mp_id) => {
+                let id = if mp_id.is_empty() {
+                    self.document.master_pages.first().map(|m| m.id.clone()).unwrap_or_else(|| {
+                        // No master pages exist yet — create one automatically
+                        let new_id = uuid::Uuid::new_v4().to_string();
+                        let name = format!("Master Page {}", self.document.master_pages.len() + 1);
+                        self.document.master_pages.push(crate::document::MasterPage {
+                            id: new_id.clone(),
+                            name,
+                            items: vec![],
+                        });
+                        self.dirty = true;
+                        new_id
+                    })
+                } else {
+                    mp_id
+                };
+                if !id.is_empty() {
+                    self.enter_master_page_mode(id);
+                }
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::ExitMasterPageMode => {
+                self.exit_master_page_mode();
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::NewMasterPage => {
+                let id = uuid::Uuid::new_v4().to_string();
+                let name = format!("Master Page {}", self.document.master_pages.len() + 1);
+                self.document.master_pages.push(crate::document::MasterPage {
+                    id: id.clone(),
+                    name,
+                    items: vec![],
+                });
+                self.dirty = true;
+                self.enter_master_page_mode(id);
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::AlignLeft => {
+                self.align_selected_horizontal(AlignH::Left);
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::AlignCenterH => {
+                self.align_selected_horizontal(AlignH::Center);
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::AlignRight => {
+                self.align_selected_horizontal(AlignH::Right);
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::AlignTop => {
+                self.align_selected_vertical(AlignV::Top);
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::AlignCenterV => {
+                self.align_selected_vertical(AlignV::Center);
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::AlignBottom => {
+                self.align_selected_vertical(AlignV::Bottom);
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::StartPickAlignmentRef => {
+                self.pick_alignment_ref = true;
+                // Don't close popover here — we're in sidebar alignment mode.
+            }
+            AppInput::SetAlignmentRef(ref_id) => {
+                self.alignment_ref_id = if ref_id.is_empty() { None } else { Some(ref_id) };
+                self.pick_alignment_ref = false;
+                self.popover_visible = true;
+            }
+            AppInput::EnterAlignmentMode => {
+                self.alignment_mode = true;
+                self.pick_alignment_ref = false;
+                self.popover_visible = false;
+                self.close_popover_and_skip_drag();
+            }
+            AppInput::ExitAlignmentMode => {
+                self.alignment_mode = false;
+                self.pick_alignment_ref = false;
+            }
+            AppInput::FitPageToWindow => {
+                let page_w = self.document.width * SCALE;
+                let page_h = self.document.height * SCALE;
+                if page_w > 0.0 && page_h > 0.0 {
+                    let vw = root.width() as f64;
+                    let vh = root.height() as f64;
+                    self.zoom = (vw / page_w).min(vh / page_h).max(0.1).min(5.0);
+                    let msg = format!("Zoom: {:.0}% (fit to window)", self.zoom * 100.0);
+                    self.fit_message = Some(msg);
+                    let s = sender.clone();
+                    gtk::glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(3000),
+                        move || { s.input(AppInput::ClearFitMessage); },
+                    );
+                }
+                self.request_focus = true;
+            }
+            AppInput::ClearFitMessage => {
+                self.fit_message = None;
+            }
             AppInput::RightClick(x, y) => {
+                if self.pick_alignment_ref {
+                    if let Some((_page_idx, item)) = self.hit_test_all_pages(x, y) {
+                        // Clicked on an item — set it as alignment reference
+                        self.alignment_ref_id = Some(item.id.clone());
+                    } else {
+                        // Clicked on empty space — use page as reference
+                        self.alignment_ref_id = None;
+                    }
+                    self.pick_alignment_ref = false;
+                    self.popover_pos = (x, y);
+                    self.popover_visible = true;
+                    return;
+                }
                 if let Some((page_idx, item)) = self.hit_test_all_pages(x, y) {
                     if !self.selected_item_ids.contains(&item.id) {
                         self.selected_item_ids = vec![item.id.clone()];
@@ -2630,11 +3191,22 @@ impl Component for AppModel {
                         }
                     }
                 }
+                let was_resize = self.active_handle.is_some();
                 self.drag_start = None;
                 self.drag_current = None;
                 self.initial_item_rects.clear();
                 self.active_handle = None;
                 self.is_moving = false;
+                if was_resize {
+                    let chained_id = self.selected_item_ids.first().cloned();
+                    if let Some(ref id) = chained_id {
+                        if is_in_chain(&self.document, id) {
+                            let sc = self.scale();
+                            reflow_chain(&mut self.document, id, sc, if self.is_editing { Some(id.as_str()) } else { None });
+                            self.reflow_version = self.reflow_version.wrapping_add(1);
+                        }
+                    }
+                }
                 if self.pending_wrap_rebuild {
                     self.rebuild_flow_providers();
                     self.pending_wrap_rebuild = false;
@@ -2700,6 +3272,7 @@ impl Component for AppModel {
                 self.undo_version = 0;
                 self.reflow_version = 0;
                 self.typing_run_active = false;
+                self.render_layout_cache.borrow_mut().clear();
 
                 self.load_all_assets();
                 self.rebuild_flow_providers();
@@ -2828,18 +3401,31 @@ impl Component for AppModel {
                     let range = self.selected_text_operation_range(&id, editing);
                     if let Some((_, item)) = self.find_item_mut(&id) {
                         if let ItemContent::Text(ref mut tb) = item.content {
+                            // Always update the base font description so that:
+                            // 1) newly-typed text uses the chosen family,
+                            // 2) export falls back to the right font when no per-span
+                            //    attribute covers the current position.
+                            // Use set_family() + to_str() so the exact family name is
+                            // preserved (Pango never strips optical-size suffixes this
+                            // way); the trailing comma that to_str() adds when size==0
+                            // is harmless because from_string() parses it back
+                            // correctly.
+                            let mut fd = gtk::pango::FontDescription::from_string(&tb.font_description);
+                            fd.set_family(&family);
+                            tb.font_description = fd.to_str().to_string();
+
+                            // Apply a per-span Family attribute to the text range so
+                            // the existing content also uses the new font.
                             if editing {
                                 let (s, e) = range.unwrap_or_else(|| tb.selection_or_word_range());
                                 if s < e {
                                     tb.apply_format(s, e, AttrValue::Family(family.clone()));
                                 }
-                            } else {
-                                if let Some((s, e)) = range {
-                                    if s < e {
-                                        tb.apply_format(s, e, AttrValue::Family(family.clone()));
-                                        self.is_editing = true;
-                                        *self.editing_flag.borrow_mut() = true;
-                                    }
+                            } else if let Some((s, e)) = range {
+                                if s < e {
+                                    tb.apply_format(s, e, AttrValue::Family(family.clone()));
+                                    self.is_editing = true;
+                                    *self.editing_flag.borrow_mut() = true;
                                 }
                             }
                         }
@@ -2849,6 +3435,7 @@ impl Component for AppModel {
                         reflow_chain(&mut self.document, &id, sc, if self.is_editing { Some(id.as_str()) } else { None });
                     }
                 }
+                self.font_entry_value = family;
                 self.invalidate_edit_layout();
                 self.request_focus = true;
             }
@@ -3108,6 +3695,67 @@ impl Component for AppModel {
                     }
                 }
             }
+            AppInput::SplitChainHere => {
+                let Some(id) = self.selected_item_ids.first().cloned() else { return; };
+                if !self.is_editing { return; }
+
+                let sc = self.scale();
+                let root_id = find_chain_root(&self.document, &id);
+                let chain = collect_chain(&self.document, &root_id);
+                let Some(b_idx) = chain.iter().position(|cid| cid == &id) else { return; };
+                // Only makes sense when there is at least one downstream frame.
+                if b_idx + 1 >= chain.len() { return; }
+
+                let root_tb = match chain_frame_textbox(&self.document, &root_id).cloned() {
+                    Some(tb) => tb,
+                    None => return,
+                };
+                let current_tb = match chain_frame_textbox(&self.document, &id).cloned() {
+                    Some(tb) => tb,
+                    None => return,
+                };
+
+                // Split point in global-text coordinates.
+                let cursor_in_b = current_tb.cursor_pos.min(current_tb.text.len());
+                let global_split = (current_tb.text_offset + cursor_in_b).min(root_tb.text.len());
+
+                let chain_1_ids = chain[..=b_idx].to_vec();   // A … B (inclusive)
+                let chain_2_ids = chain[b_idx + 1..].to_vec(); // C … (everything after)
+
+                let global_text = root_tb.text.clone();
+                let global_attrs = root_tb.attributes.clone();
+
+                let text_1 = global_text[..global_split].to_string();
+                let attrs_1 = slice_attrs_for_range(&global_attrs, 0, global_split);
+
+                let text_2 = global_text[global_split..].to_string();
+                let attrs_2 = slice_attrs_for_range(&global_attrs, global_split, global_text.len());
+
+                // Rewrite link pointers: chain 1 ends at B, chain 2 starts at C.
+                set_chain_links(&mut self.document, &chain_1_ids);
+                set_chain_links(&mut self.document, &chain_2_ids);
+
+                // Give each new root its portion of the global text.
+                set_chain_frame_content(&mut self.document, &chain_1_ids[0], text_1, attrs_1, 0);
+                set_chain_frame_content(&mut self.document, &chain_2_ids[0], text_2, attrs_2, 0);
+
+                // Reflow each chain to distribute text across its frames.
+                if chain_1_ids.len() > 1 {
+                    reflow_chain(&mut self.document, &chain_1_ids[0], sc, None);
+                }
+                if chain_2_ids.len() > 1 {
+                    reflow_chain(&mut self.document, &chain_2_ids[0], sc, None);
+                }
+
+                self.reflow_version = self.reflow_version.wrapping_add(1);
+                self.render_layout_cache.borrow_mut().clear();
+                self.is_editing = false;
+                *self.editing_flag.borrow_mut() = false;
+                self.typing_run_active = false;
+                self.invalidate_edit_layout();
+                self.popover_visible = false;
+                self.dirty = true;
+            }
             AppInput::SetWrapMode(mode) => {
                 if let Some(id) = self.selected_item_ids.first().cloned() {
                     if let Some((_, item)) = self.find_item_mut(&id) {
@@ -3130,6 +3778,195 @@ impl Component for AppModel {
                 self.autoscroll_timer = None;
             }
         }
+    }
+}
+
+// ── Master-pages sidebar builder ──────────────────────────────────────────────
+
+fn rebuild_master_pages_ui(
+    model: &AppModel,
+    listbox: &mut gtk::ListBox,
+    sender: ComponentSender<AppModel>,
+) {
+    while let Some(row) = listbox.first_child() {
+        listbox.remove(&row);
+    }
+
+    let current_master = model.document.pages
+        .get(model.current_page)
+        .and_then(|p| p.master_page.as_deref());
+
+    for mp in &model.document.master_pages {
+        let is_applied = current_master == Some(mp.id.as_str());
+        let page_count = model.document.pages.iter()
+            .filter(|p| p.master_page.as_deref() == Some(mp.id.as_str()))
+            .count();
+
+        let row = gtk::ListBoxRow::new();
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        hbox.set_margin_all(4);
+
+        let label_text = if page_count > 0 {
+            format!("{} ({} pages)", mp.name, page_count)
+        } else {
+            mp.name.clone()
+        };
+        let name_label = gtk::Label::new(Some(&label_text));
+        name_label.set_xalign(0.0);
+        name_label.set_hexpand(true);
+        if is_applied {
+            name_label.set_markup(&format!("<b>{}</b> (current)", label_text));
+        }
+        hbox.append(&name_label);
+
+        if !is_applied {
+            let mp_id = mp.id.clone();
+            let s = sender.clone();
+            let apply_btn = gtk::Button::from_icon_name("emblem-ok-symbolic");
+            apply_btn.set_tooltip_text(Some("Apply to current page"));
+            apply_btn.add_css_class("flat");
+            apply_btn.connect_clicked(move |_| {
+                s.input(AppInput::ApplyMasterPage(mp_id.clone()));
+            });
+            hbox.append(&apply_btn);
+        } else {
+            let s = sender.clone();
+            let remove_btn = gtk::Button::from_icon_name("edit-undo-symbolic");
+            remove_btn.set_tooltip_text(Some("Remove from current page"));
+            remove_btn.add_css_class("flat");
+            remove_btn.connect_clicked(move |_| {
+                s.input(AppInput::RemoveMasterPageFromPage);
+            });
+            hbox.append(&remove_btn);
+        }
+
+        {
+            let mp_id = mp.id.clone();
+            let s = sender.clone();
+            let edit_btn = gtk::Button::from_icon_name("document-edit-symbolic");
+            edit_btn.set_tooltip_text(Some("Edit master page"));
+            edit_btn.add_css_class("flat");
+            if model.is_master_page_mode() && model.selected_master_page_id.as_deref() == Some(mp.id.as_str()) {
+                edit_btn.add_css_class("suggested-action");
+            }
+            edit_btn.connect_clicked(move |_| {
+                s.input(AppInput::EnterMasterPageMode(mp_id.clone()));
+            });
+            hbox.append(&edit_btn);
+        }
+
+        {
+            let mp_id = mp.id.clone();
+            let mp_name = mp.name.clone();
+            let s = sender.clone();
+            let rename_btn = gtk::Button::from_icon_name("document-edit-symbolic");
+            rename_btn.set_tooltip_text(Some("Rename"));
+            rename_btn.add_css_class("flat");
+            rename_btn.connect_clicked(move |_| {
+                let w = gtk::Window::new();
+                w.set_title(Some("Rename Master Page"));
+                w.set_modal(true);
+                w.set_default_size(350, -1);
+
+                let vbox = gtk::Box::new(gtk::Orientation::Vertical, 12);
+                vbox.set_margin_all(16);
+
+                let label = gtk::Label::new(Some(&format!("Rename \"{}\":", mp_name)));
+                label.set_xalign(0.0);
+                vbox.append(&label);
+
+                let entry = gtk::Entry::new();
+                entry.set_text(&mp_name);
+                entry.set_activates_default(true);
+                vbox.append(&entry);
+
+                let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+                btn_box.set_halign(gtk::Align::End);
+                btn_box.set_homogeneous(true);
+
+                let cancel_btn = gtk::Button::with_label("Cancel");
+                {
+                    let w2 = w.downgrade();
+                    cancel_btn.connect_clicked(move |_| {
+                        if let Some(w) = w2.upgrade() { w.close(); }
+                    });
+                }
+                btn_box.append(&cancel_btn);
+
+                let ok_btn = gtk::Button::with_label("Rename");
+                ok_btn.add_css_class("suggested-action");
+                {
+                    let mid = mp_id.clone();
+                    let s = s.clone();
+                    let entry = entry.clone();
+                    let w_weak = w.downgrade();
+                    ok_btn.connect_clicked(move |_| {
+                        let n = entry.text().to_string();
+                        if !n.is_empty() {
+                            s.input(AppInput::RenameMasterPage(mid.clone(), n));
+                        }
+                        if let Some(w) = w_weak.upgrade() { w.close(); }
+                    });
+                }
+                btn_box.append(&cancel_btn);
+
+                let ok_btn = gtk::Button::with_label("Rename");
+                ok_btn.add_css_class("suggested-action");
+                {
+                    let mid = mp_id.clone();
+                    let s = s.clone();
+                    let entry = entry.clone();
+                    let w_weak = w.downgrade();
+                    ok_btn.connect_clicked(move |_| {
+                        let n = entry.text().to_string();
+                        if !n.is_empty() {
+                            s.input(AppInput::RenameMasterPage(mid.clone(), n));
+                        }
+                        if let Some(w) = w_weak.upgrade() { w.close(); }
+                    });
+                }
+                btn_box.append(&ok_btn);
+
+                vbox.append(&btn_box);
+                w.set_child(Some(&vbox));
+                w.present();
+            });
+            hbox.append(&rename_btn);
+        }
+
+        {
+            let mp_id = mp.id.clone();
+            let mp_name = mp.name.clone();
+            let s = sender.clone();
+            let delete_btn = gtk::Button::from_icon_name("edit-delete-symbolic");
+            delete_btn.set_tooltip_text(Some("Delete master page"));
+            delete_btn.add_css_class("flat");
+            delete_btn.add_css_class("destructive-action");
+            delete_btn.connect_clicked(move |_| {
+                let dialog = gtk::AlertDialog::builder()
+                    .modal(true)
+                    .message("Delete Master Page")
+                    .detail(&format!("Delete \"{}\"?\nPages using this master page will lose its items.", mp_name))
+                    .buttons(["Cancel", "Delete"])
+                    .cancel_button(0)
+                    .default_button(0)
+                    .build();
+
+                let mid = mp_id.clone();
+                let s2 = s.clone();
+                dialog.choose(None::<&gtk::Window>, gtk::gio::Cancellable::NONE, move |result| {
+                    if let Ok(response) = result {
+                        if response == 1 {
+                            s2.input(AppInput::DeleteMasterPage(mid.clone()));
+                        }
+                    }
+                });
+            });
+            hbox.append(&delete_btn);
+        }
+
+        row.set_child(Some(&hbox));
+        listbox.append(&row);
     }
 }
 
@@ -3161,7 +3998,145 @@ impl AppModel {
                 }
             }
         }
+
+        for mp in &self.document.master_pages {
+            for item in &mp.items {
+                match &item.content {
+                    ItemContent::Image(ib) => {
+                        if let Some(ref path) = ib.image_path {
+                            if !self.image_surfaces.contains_key(path.as_str()) {
+                                if let Some(surface) = ImageBox::load_surface(path) {
+                                    self.image_surfaces.insert(path.clone(), Rc::new(surface));
+                                }
+                            }
+                        }
+                    }
+                    ItemContent::Svg(sb) => {
+                        if !sb.svg_path.is_empty() && !self.svg_handles.contains_key(&sb.svg_path) {
+                            if let Ok(handle) = rsvg::Loader::new().read_path(&sb.svg_path) {
+                                self.svg_handles.insert(sb.svg_path.clone(), Rc::new(handle));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
+
+    // ── Master page editing mode ────────────────────────────────────────────
+
+    pub fn is_master_page_mode(&self) -> bool {
+        self.master_page_mode && self.selected_master_page_id.is_some()
+    }
+
+    fn enter_master_page_mode(&mut self, mp_id: String) {
+        if self.is_master_page_mode() && self.selected_master_page_id.as_deref() == Some(&mp_id) {
+            return;
+        }
+        // Save edits back to outgoing master page, then exit previous mode
+        if self.selected_master_page_id.is_some() {
+            self.exit_master_page_mode_inner();
+        }
+
+        // Save original page-0 items so we can restore them on exit
+        if self.saved_page_0_items.is_none() {
+            self.saved_page_0_items = Some(self.document.pages[0].items.clone());
+        }
+
+        // Load master page items into page 0
+        self.document.pages[0].items = self.clone_master_items(&mp_id);
+        self.selected_master_page_id = Some(mp_id);
+        self.master_page_mode = true;
+        self.current_page = 0;
+        self.selected_item_ids.clear();
+        self.is_editing = false;
+        *self.editing_flag.borrow_mut() = false;
+        self.invalidate_edit_layout();
+        self.dirty = true;
+    }
+
+    fn exit_master_page_mode(&mut self) {
+        if !self.is_master_page_mode() { return; }
+        self.exit_master_page_mode_inner();
+        // Restore original page 0 items
+        if let Some(items) = self.saved_page_0_items.take() {
+            self.document.pages[0].items = items;
+        }
+        self.selected_master_page_id = None;
+        self.master_page_mode = false;
+        self.selected_item_ids.clear();
+        self.is_editing = false;
+        *self.editing_flag.borrow_mut() = false;
+        self.invalidate_edit_layout();
+        self.dirty = true;
+    }
+
+    fn exit_master_page_mode_inner(&mut self) {
+        // Save edits back to the master page
+        if let Some(ref mp_id) = self.selected_master_page_id {
+            if let Some(mp) = self.document.master_pages.iter_mut().find(|m| m.id == *mp_id) {
+                mp.items = self.document.pages[0].items.clone();
+            }
+        }
+    }
+
+    fn clone_master_items(&self, mp_id: &str) -> Vec<Item> {
+        self.document.master_pages.iter()
+            .find(|m| m.id == mp_id)
+            .map(|m| m.items.clone())
+            .unwrap_or_default()
+    }
+
+    fn effective_page_count(&self) -> usize {
+        if self.is_master_page_mode() { 1 } else { self.document.pages.len() }
+    }
+
+    // ── End master page editing mode ────────────────────────────────────────
+
+    // ── Alignment helpers ───────────────────────────────────────────────────
+
+    fn get_alignment_ref_bounds(&self) -> (f64, f64, f64, f64) {
+        if let Some(ref ref_id) = self.alignment_ref_id {
+            if let Some((_, item)) = self.find_item(ref_id) {
+                return (item.x, item.y, item.width, item.height);
+            }
+        }
+        // Page reference (or ref item not found)
+        (0.0, 0.0, self.document.width, self.document.height)
+    }
+
+    fn align_selected_horizontal(&mut self, align: AlignH) {
+        let ref_bounds = self.get_alignment_ref_bounds();
+        let ids: Vec<String> = self.selected_item_ids.clone();
+        for id in &ids {
+            if let Some((_, item)) = self.find_item_mut(id) {
+                match align {
+                    AlignH::Left   => item.x = ref_bounds.0,
+                    AlignH::Center => item.x = ref_bounds.0 + (ref_bounds.2 - item.width) / 2.0,
+                    AlignH::Right  => item.x = ref_bounds.0 + ref_bounds.2 - item.width,
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn align_selected_vertical(&mut self, align: AlignV) {
+        let ref_bounds = self.get_alignment_ref_bounds();
+        let ids: Vec<String> = self.selected_item_ids.clone();
+        for id in &ids {
+            if let Some((_, item)) = self.find_item_mut(id) {
+                match align {
+                    AlignV::Top    => item.y = ref_bounds.1,
+                    AlignV::Center => item.y = ref_bounds.1 + (ref_bounds.3 - item.height) / 2.0,
+                    AlignV::Bottom => item.y = ref_bounds.1 + ref_bounds.3 - item.height,
+                }
+            }
+        }
+        self.dirty = true;
+    }
+
+    // ── End alignment helpers ───────────────────────────────────────────────
 
     /// Re-computes all flow providers for the current document.
     /// Called after any image WrapMode change, move, or resize.
@@ -3489,27 +4464,69 @@ fn collect_chain_visible_lengths(doc: &Document) -> HashMap<String, usize> {
 
 /// Redistributes the chain's text across all linked frames.
 fn reflow_chain(doc: &mut Document, any_id: &str, scale: f64, editing_id: Option<&str>) {
+    use gtk::pango::prelude::FontMapExt;
     let started = std::time::Instant::now();
     let root_id = find_chain_root(doc, any_id);
     let chain = collect_chain(doc, &root_id);
     if chain.len() < 2 { return; }
 
-    // Snapshot each frame's current data (text + attrs + dimensions)
-    struct FrameSnap {
+    struct ReflowFrameSnap {
         id: String,
         w: f64,
         h: f64,
-        tb: TextBox,
+        text: String,
+        attributes: Vec<TextAttribute>,
+        text_offset: usize,
+        font_description: String,
+        padding: f64,
+        line_spacing: f64,
+        alignment: TextAlign,
     }
-    let snaps: Vec<FrameSnap> = chain.iter().map(|id| {
+    let snaps: Vec<ReflowFrameSnap> = chain.iter().map(|id| {
         doc.pages.iter()
             .flat_map(|p| p.items.iter())
             .find(|i| &i.id == id)
             .map(|item| {
-                let tb = if let ItemContent::Text(tb) = &item.content { tb.clone() } else { TextBox::default() };
-                FrameSnap { id: id.clone(), w: item.width, h: item.height, tb }
+                if let ItemContent::Text(tb) = &item.content {
+                    ReflowFrameSnap {
+                        id: id.clone(),
+                        w: item.width,
+                        h: item.height,
+                        text: tb.text.clone(),
+                        attributes: tb.attributes.clone(),
+                        text_offset: tb.text_offset,
+                        font_description: tb.font_description.clone(),
+                        padding: tb.padding,
+                        line_spacing: tb.line_spacing,
+                        alignment: tb.alignment,
+                    }
+                } else {
+                    ReflowFrameSnap {
+                        id: id.clone(),
+                        w: item.width,
+                        h: item.height,
+                        text: String::new(),
+                        attributes: vec![],
+                        text_offset: 0,
+                        font_description: String::from("Sans 11"),
+                        padding: 0.0,
+                        line_spacing: 1.0,
+                        alignment: TextAlign::Left,
+                    }
+                }
             })
-            .unwrap_or_else(|| FrameSnap { id: id.clone(), w: 100.0, h: 100.0, tb: TextBox::default() })
+            .unwrap_or_else(|| ReflowFrameSnap {
+                id: id.clone(),
+                w: 100.0,
+                h: 100.0,
+                text: String::new(),
+                attributes: vec![],
+                text_offset: 0,
+                font_description: String::from("Sans 11"),
+                padding: 0.0,
+                line_spacing: 1.0,
+                alignment: TextAlign::Left,
+            })
     }).collect();
 
     // Priority: editing_id branch FIRST, then legacy detection.
@@ -3519,34 +4536,34 @@ fn reflow_chain(doc: &mut Document, any_id: &str, scale: f64, editing_id: Option
     // the global text by the number of frames on every keystroke.
     let (global_text, global_attrs) = if let Some(editing_id) = editing_id.filter(|id| chain.iter().any(|cid| cid == id)) {
         if editing_id == root_id {
-            (snaps[0].tb.text.clone(), snaps[0].tb.attributes.clone())
+            (snaps[0].text.clone(), snaps[0].attributes.clone())
         } else {
             let editing_snap = snaps.iter().find(|snap| snap.id == editing_id).unwrap();
-            let prefix_end = editing_snap.tb.text_offset.min(snaps[0].tb.text.len());
-            let mut text = snaps[0].tb.text[..prefix_end].to_string();
-            text.push_str(&editing_snap.tb.text);
+            let prefix_end = editing_snap.text_offset.min(snaps[0].text.len());
+            let mut text = snaps[0].text[..prefix_end].to_string();
+            text.push_str(&editing_snap.text);
 
-            let mut attrs = slice_attrs_for_range(&snaps[0].tb.attributes, 0, prefix_end);
-            attrs.extend(shift_attrs(&editing_snap.tb.attributes, prefix_end));
+            let mut attrs = slice_attrs_for_range(&snaps[0].attributes, 0, prefix_end);
+            attrs.extend(shift_attrs(&editing_snap.attributes, prefix_end));
             (text, attrs)
         }
     } else {
         // Legacy detection: old files stored slices instead of suffixes; detect by
         // checking if any downstream frame's text extends beyond the root's text length.
         let legacy_layout = snaps.iter().skip(1).any(|snap| {
-            !snap.tb.text.is_empty() && snaps[0].tb.text.len() < snap.tb.text_offset + snap.tb.text.len()
+            !snap.text.is_empty() && snaps[0].text.len() < snap.text_offset + snap.text.len()
         });
         if legacy_layout {
             let mut text = String::new();
             let mut attrs = Vec::new();
             for snap in &snaps {
                 let offset = text.len();
-                text.push_str(&snap.tb.text);
-                attrs.extend(shift_attrs(&snap.tb.attributes, offset));
+                text.push_str(&snap.text);
+                attrs.extend(shift_attrs(&snap.attributes, offset));
             }
             (text, attrs)
         } else {
-            (snaps[0].tb.text.clone(), snaps[0].tb.attributes.clone())
+            (snaps[0].text.clone(), snaps[0].attributes.clone())
         }
     };
 
@@ -3556,6 +4573,12 @@ fn reflow_chain(doc: &mut Document, any_id: &str, scale: f64, editing_id: Option
     // PROBE_LIMIT: cap for probe text — well above any single-frame capacity (~4KB for A4)
     // so measurements are accurate without allocating/copying large suffixes (500KB+).
     const PROBE_LIMIT: usize = 15_000;
+    let pango_ctx = {
+        let font_map = pangocairo::FontMap::default();
+        let ctx = font_map.create_context();
+        pangocairo::functions::context_set_resolution(&ctx, 25.4 * scale);
+        ctx
+    };
     let mut offset = 0usize;
     let n = snaps.len();
     let mut last_frame_overflows = false;
@@ -3570,13 +4593,21 @@ fn reflow_chain(doc: &mut Document, any_id: &str, scale: f64, editing_id: Option
             // For the last frame, also compute overflow_hint so draw_page_content
             // doesn't have to call text_capacity again on every render cycle.
             if remaining.len() > PROBE_LIMIT {
-                // A single frame never holds 15KB+ — definitely overflows.
                 last_frame_overflows = true;
             } else {
-                let mut temp = snap.tb.clone();
-                temp.text = remaining.to_string();
-                temp.attributes = slice_attrs_for_range(&global_attrs, offset, global_text.len());
-                let cap = temp.text_capacity(snap.w * scale, snap.h * scale, scale);
+                let attrs = slice_attrs_for_range(&global_attrs, offset, global_text.len());
+                let cap = TextBox::measure_capacity(
+                    &pango_ctx,
+                    remaining,
+                    &attrs,
+                    &snap.font_description,
+                    snap.padding,
+                    snap.line_spacing,
+                    snap.alignment,
+                    snap.w * scale,
+                    snap.h * scale,
+                    scale,
+                );
                 last_frame_overflows = cap < remaining.len();
             }
             remaining.len()
@@ -3588,10 +4619,19 @@ fn reflow_chain(doc: &mut Document, any_id: &str, scale: f64, editing_id: Option
                 while e > 0 && !remaining.is_char_boundary(e) { e -= 1; }
                 e
             };
-            let mut temp = snap.tb.clone();
-            temp.text = remaining[..probe_end].to_string();
-            temp.attributes = slice_attrs_for_range(&global_attrs, offset, offset + probe_end);
-            temp.text_capacity(snap.w * scale, snap.h * scale, scale)
+            let attrs = slice_attrs_for_range(&global_attrs, offset, offset + probe_end);
+            TextBox::measure_capacity(
+                &pango_ctx,
+                &remaining[..probe_end],
+                &attrs,
+                &snap.font_description,
+                snap.padding,
+                snap.line_spacing,
+                snap.alignment,
+                snap.w * scale,
+                snap.h * scale,
+                scale,
+            )
         };
 
         if remaining.len() > 2_000 {
@@ -3644,12 +4684,41 @@ fn reflow_chain(doc: &mut Document, any_id: &str, scale: f64, editing_id: Option
     }
 }
 
-fn make_pango_ctx() -> gtk::pango::Context {
+fn make_pango_ctx_with_resolution(dpi: f64) -> gtk::pango::Context {
     use gtk::pango::prelude::FontMapExt;
     let font_map = pangocairo::FontMap::default();
     let ctx = font_map.create_context();
-    pangocairo::functions::context_set_resolution(&ctx, 25.4 * SCALE);
+    pangocairo::functions::context_set_resolution(&ctx, dpi);
     ctx
+}
+
+fn make_pango_ctx() -> gtk::pango::Context {
+    let ctx = make_pango_ctx_with_resolution(25.4 * SCALE);
+    // At 76.2 DPI (= 25.4 mm/in * SCALE=3 px/mm), font sizes are non-integer
+    // pixel counts (e.g. 12pt → 12.7 px).  With the default HintMetrics::On,
+    // Pango rounds per-glyph advance heights to whole pixels, but they round
+    // differently for each glyph shape, so letters on the same baseline end up
+    // on different screen pixel rows — the "letters at different heights" effect.
+    // HintMetrics::Off uses exact fractional metrics; HintStyle::Slight keeps
+    // mild hinting for readability without aggressively snapping stroke widths.
+    if let Ok(mut opts) = cairo::FontOptions::new() {
+        opts.set_hint_metrics(cairo::HintMetrics::Off);
+        opts.set_hint_style(cairo::HintStyle::Slight);
+        pangocairo::functions::context_set_font_options(&ctx, Some(&opts));
+    }
+    ctx
+}
+
+fn selected_text_frame_has_next_chain(doc: &Document, selected_ids: &[String], is_editing: bool) -> bool {
+    if !is_editing || selected_ids.len() != 1 { return false; }
+    let id = &selected_ids[0];
+    doc.pages.iter()
+        .flat_map(|p| p.items.iter())
+        .find(|i| &i.id == id)
+        .map(|item| {
+            if let ItemContent::Text(tb) = &item.content { tb.next_frame_id.is_some() } else { false }
+        })
+        .unwrap_or(false)
 }
 
 fn is_selected_type(doc: &Document, selected_ids: &[String], ty: &ItemType) -> bool {
@@ -3821,6 +4890,8 @@ fn draw_page_content(
     flow_providers: &HashMap<String, PrecomputedFlowProvider>,
     editing_layout: Option<&(String, gtk::pango::Layout)>,
     is_export: bool,
+    render_cache: Option<&Rc<RefCell<HashMap<LayoutCacheKey, gtk::pango::Layout>>>>,
+    reflow_version: u64,
 ) {
     for item in &page.items {
         let is_selected = selected_ids.contains(&item.id);
@@ -3835,11 +4906,6 @@ fn draw_page_content(
         match &item.content {
             ItemContent::Text(tb) => {
                 let flow = flow_providers.get(&item.id).map(|p| p as &dyn crate::text_flow::TextFlowProvider);
-                let cached_layout = if is_editing_this {
-                    editing_layout.and_then(|(id, layout)| if *id == item.id { Some(layout) } else { None })
-                } else {
-                    None
-                };
                 let visible_len = visible_lengths.get(&item.id).copied().unwrap_or(tb.text.len()).min(tb.text.len());
                 // Limit display to visible_len for ALL frames that have a successor (root + intermediate).
                 // Without this, editing such a frame shows the full suffix—content belonging to later
@@ -3847,20 +4913,66 @@ fn draw_page_content(
                 // just enough to keep the cursor visible when it's past the normal frame boundary.
                 let display_len = if visible_len < tb.text.len() {
                     if is_editing_this {
-                        tb.cursor_pos.saturating_add(200).min(tb.text.len()).max(visible_len)
+                        let raw = tb.cursor_pos.saturating_add(200).min(tb.text.len()).max(visible_len);
+                        // cursor_pos+200 may land mid-char; snap back to the nearest boundary.
+                        let mut d = raw;
+                        while d > visible_len && !tb.text.is_char_boundary(d) { d -= 1; }
+                        d
                     } else {
                         visible_len
                     }
                 } else {
                     tb.text.len()
                 };
-                if display_len < tb.text.len() {
-                    let mut visible_tb = tb.clone();
-                    visible_tb.text.truncate(display_len);
-                    visible_tb.attributes = slice_attrs_for_range(&tb.attributes, 0, display_len);
-                    visible_tb.render(cr, pango_ctx, w, h, is_selected, is_editing_this, item.show_border, scale_factor, flow, None, is_export);
+
+                if is_editing_this {
+                    // Editing frame: use edit_layout_cache (managed separately), no render cache.
+                    let editing_layout_ref = editing_layout
+                        .and_then(|(id, layout)| if *id == item.id { Some(layout) } else { None });
+                    if display_len < tb.text.len() {
+                        let mut visible_tb = tb.clone();
+                        visible_tb.text.truncate(display_len);
+                        visible_tb.attributes = slice_attrs_for_range(&tb.attributes, 0, display_len);
+                        visible_tb.render(cr, pango_ctx, w, h, is_selected, true, item.show_border, scale_factor, flow, None, is_export);
+                    } else {
+                        tb.render(cr, pango_ctx, w, h, is_selected, true, item.show_border, scale_factor, flow, editing_layout_ref, is_export);
+                    }
+                } else if flow.is_some() {
+                    // Flow-provider path has its own layout logic — skip render cache.
+                    tb.render(cr, pango_ctx, w, h, is_selected, false, item.show_border, scale_factor, flow, None, is_export);
+                } else if let Some(cache) = render_cache {
+                    // Non-editing frame: look up or populate the render layout cache.
+                    let key = LayoutCacheKey {
+                        item_id: item.id.clone(),
+                        w_bits: w.to_bits(),
+                        h_bits: h.to_bits(),
+                        display_len,
+                        reflow_version,
+                    };
+                    let cached = cache.borrow().get(&key).cloned();
+                    let layout = cached.unwrap_or_else(|| {
+                        let padding = tb.padding * scale_factor;
+                        let l = if display_len < tb.text.len() {
+                            let slice_text = &tb.text[..display_len];
+                            let slice_attrs = slice_attrs_for_range(&tb.attributes, 0, display_len);
+                            tb.prepare_layout_for_slice(pango_ctx, w, padding, slice_text, &slice_attrs)
+                        } else {
+                            tb.prepare_layout(pango_ctx, w, padding)
+                        };
+                        cache.borrow_mut().insert(key, l.clone());
+                        l
+                    });
+                    tb.render(cr, pango_ctx, w, h, is_selected, false, item.show_border, scale_factor, None, Some(&layout), is_export);
                 } else {
-                    tb.render(cr, pango_ctx, w, h, is_selected, is_editing_this, item.show_border, scale_factor, flow, cached_layout, is_export);
+                    // Export path (no cache): direct render.
+                    if display_len < tb.text.len() {
+                        let mut visible_tb = tb.clone();
+                        visible_tb.text.truncate(display_len);
+                        visible_tb.attributes = slice_attrs_for_range(&tb.attributes, 0, display_len);
+                        visible_tb.render(cr, pango_ctx, w, h, false, false, item.show_border, scale_factor, flow, None, is_export);
+                    } else {
+                        tb.render(cr, pango_ctx, w, h, false, false, item.show_border, scale_factor, flow, None, is_export);
+                    }
                 }
             }
             ItemContent::Image(ib) => {
@@ -4023,6 +5135,9 @@ fn draw_canvas(
     link_drag: Option<((f64, f64), (f64, f64))>,
     flow_providers: &HashMap<String, PrecomputedFlowProvider>,
     editing_layout: Option<&(String, gtk::pango::Layout)>,
+    render_cache: &Rc<RefCell<HashMap<LayoutCacheKey, gtk::pango::Layout>>>,
+    reflow_version: u64,
+    master_page_mode: bool,
 ) {
     cr.save().unwrap();
     cr.scale(zoom, zoom);
@@ -4043,7 +5158,9 @@ fn draw_canvas(
     let visible_lengths = collect_chain_visible_lengths(doc);
 
     let page_gap = 20.0;
-    for (page_idx, page) in doc.pages.iter().enumerate() {
+    let pages_to_show = if master_page_mode { 1 } else { doc.pages.len() };
+
+    for (page_idx, page) in doc.pages.iter().enumerate().take(pages_to_show) {
         let (off_x, off_y) = match layout {
             PageLayout::Vertical => (0.0, page_idx as f64 * (doc.height + page_gap)),
             PageLayout::Horizontal => (page_idx as f64 * (doc.width + page_gap), 0.0),
@@ -4073,7 +5190,61 @@ fn draw_canvas(
         cr.stroke().unwrap();
         cr.set_dash(&[], 0.0);
 
-        draw_page_content(cr, &pango_ctx, page, images, svg_handles, selected_ids, is_editing, true, SCALE, &chain_ids, &visible_lengths, flow_providers, editing_layout, false);
+        // Master page items (rendered as dimmed background layer)
+        // Skip when in master-page editing mode (we ARE the master page)
+        if !master_page_mode {
+            if let Some(ref mp_id) = page.master_page {
+            if let Some(mp) = doc.master_pages.iter().find(|m| m.id == *mp_id) {
+                cr.save().unwrap();
+                // Render all master items as a group at reduced opacity
+                cr.push_group();
+                for item in &mp.items {
+                    cr.save().unwrap();
+                    cr.translate(item.x * SCALE, item.y * SCALE);
+                    cr.rotate(item.rotation.to_radians());
+
+                    let w = item.width * SCALE;
+                    let h = item.height * SCALE;
+
+                    match &item.content {
+                        ItemContent::Text(tb) => {
+                            let page_num = page_idx + 1;
+                            let total = doc.pages.len();
+                            let subs = tb.substitute_page_numbers(page_num, total);
+                            subs.render(cr, &pango_ctx, w, h, false, false, item.show_border, SCALE, None, None, false);
+                        }
+                        ItemContent::Image(ib) => {
+                            let surface = ib.image_path.as_ref()
+                                .and_then(|p| images.get(p.as_str()))
+                                .map(|rc| rc.as_ref());
+                            ib.render(cr, w, h, false, item.show_border, surface);
+                        }
+                        ItemContent::Svg(sb) => {
+                            let handle = svg_handles.get(&sb.svg_path)
+                                .map(|rc| rc.as_ref());
+                            sb.render(cr, w, h, false, item.show_border, handle);
+                        }
+                        ItemContent::Shape => {
+                            cr.set_source_rgba(0.85, 0.85, 0.95, 1.0);
+                            cr.rectangle(0.0, 0.0, w, h);
+                            cr.fill().unwrap();
+                            cr.set_source_rgba(0.5, 0.5, 0.7, 1.0);
+                            cr.set_line_width(1.0);
+                            cr.rectangle(0.0, 0.0, w, h);
+                            cr.stroke().unwrap();
+                        }
+                    }
+
+                    cr.restore().unwrap();
+                }
+                cr.pop_group_to_source().unwrap();
+                cr.paint_with_alpha(0.55).unwrap();
+                cr.restore().unwrap();
+            }
+            }
+        }
+
+        draw_page_content(cr, &pango_ctx, page, images, svg_handles, selected_ids, is_editing, true, SCALE, &chain_ids, &visible_lengths, flow_providers, editing_layout, false, Some(render_cache), reflow_version);
 
         cr.restore().unwrap();
     }
@@ -4131,19 +5302,32 @@ pub fn export_to_pdf(
     let surface = cairo::PdfSurface::new(width_pt, height_pt, path)?;
     let cr = cairo::Context::new(&surface)?;
 
+    // Disable font hinting for PDF: hinting snaps glyph outlines to pixel
+    // boundaries (making fonts appear bolder) and skews advance widths so
+    // they don't match the embedded vector outlines, breaking spacing.
+    let mut font_options = cairo::FontOptions::new()?;
+    font_options.set_hint_style(cairo::HintStyle::None);
+    font_options.set_hint_metrics(cairo::HintMetrics::Off);
+    cr.set_font_options(&font_options);
+
+    // create_context ties the Pango context to the Cairo PDF surface and calls
+    // update_context internally, which makes Cairo's PDF backend choose CID composite
+    // fonts (with ToUnicode CMap) instead of WinAnsi Type-1 encoding.
     let pango_ctx = pangocairo::functions::create_context(&cr);
-    pangocairo::functions::context_set_resolution(&pango_ctx, 25.4 * SCALE);
+    pangocairo::functions::context_set_font_options(&pango_ctx, Some(&font_options));
+    pangocairo::functions::context_set_resolution(&pango_ctx, 72.0);
     let visible_lengths = collect_chain_visible_lengths(document);
 
-    for page in &document.pages {
+    for (page_idx, page) in document.pages.iter().enumerate() {
         surface.set_size(width_pt, height_pt)?;
         cr.save()?;
-        let pdf_scale = mm_to_points / SCALE;
-        cr.scale(pdf_scale, pdf_scale);
+        // Sync the Pango context with the current Cairo surface/transform state so
+        // font metrics and glyph outlines stay accurate for each page.
+        pangocairo::functions::update_context(&cr, &pango_ctx);
 
         // Rebuild flow providers for this page during export
         let mut page_flow_providers = HashMap::new();
-        let scale = SCALE;
+        let scale = mm_to_points;
         const FLOW_PADDING_PX: f64 = 3.0;
         let wrap_images: Vec<&Item> = page.items.iter()
             .filter(|it| matches!(&it.content, ItemContent::Image(ib) if ib.wrap_mode != WrapMode::Independent))
@@ -4235,7 +5419,52 @@ pub fn export_to_pdf(
             }
         }
 
-        draw_page_content(&cr, &pango_ctx, page, images, svg_handles, &[], false, false, SCALE, &[], &visible_lengths, &page_flow_providers, None, true);
+        // Master page items (rendered at full opacity for PDF export)
+        if let Some(ref mp_id) = page.master_page {
+            if let Some(mp) = document.master_pages.iter().find(|m| m.id == *mp_id) {
+                let page_num = page_idx + 1;
+                let total = document.pages.len();
+                for item in &mp.items {
+                    cr.save()?;
+                    cr.translate(item.x * mm_to_points, item.y * mm_to_points);
+                    cr.rotate(item.rotation.to_radians());
+
+                    let w = item.width * mm_to_points;
+                    let h = item.height * mm_to_points;
+
+                    match &item.content {
+                        ItemContent::Text(tb) => {
+                            let subs = tb.substitute_page_numbers(page_num, total);
+                            subs.render(&cr, &pango_ctx, w, h, false, false, item.show_border, mm_to_points, None, None, true);
+                        }
+                        ItemContent::Image(ib) => {
+                            let surface = ib.image_path.as_ref()
+                                .and_then(|p| images.get(p.as_str()))
+                                .map(|rc| rc.as_ref());
+                            ib.render(&cr, w, h, false, item.show_border, surface);
+                        }
+                        ItemContent::Svg(sb) => {
+                            let handle = svg_handles.get(&sb.svg_path)
+                                .map(|rc| rc.as_ref());
+                            sb.render(&cr, w, h, false, item.show_border, handle);
+                        }
+                        ItemContent::Shape => {
+                            cr.set_source_rgba(0.85, 0.85, 0.95, 1.0);
+                            cr.rectangle(0.0, 0.0, w, h);
+                            cr.fill()?;
+                            cr.set_source_rgba(0.5, 0.5, 0.7, 1.0);
+                            cr.set_line_width(1.0);
+                            cr.rectangle(0.0, 0.0, w, h);
+                            cr.stroke()?;
+                        }
+                    }
+
+                    cr.restore()?;
+                }
+            }
+        }
+
+        draw_page_content(&cr, &pango_ctx, page, images, svg_handles, &[], false, false, mm_to_points, &[], &visible_lengths, &page_flow_providers, None, true, None, 0);
 
         cr.restore()?;
         cr.show_page()?;
@@ -4243,4 +5472,196 @@ pub fn export_to_pdf(
 
     surface.finish();
     Ok(())
+}
+
+// ── Custom font dialog ────────────────────────────────────────────────────────
+
+/// Opens a modal font picker that lists every Pango family / face and
+/// reconstructs the exact family string needed for fontconfig (e.g.
+/// "EB Garamond 12" instead of the generic "EB Garamond").
+fn show_custom_font_dialog(
+    parent: &adw::ApplicationWindow,
+    sender: relm4::ComponentSender<AppModel>,
+) {
+    use pangocairo::prelude::{FontMapExt, FontFamilyExt, FontFaceExt};
+
+    let dialog = gtk::Window::builder()
+        .title("Choose Font")
+        .modal(true)
+        .transient_for(parent.upcast_ref::<gtk::Window>())
+        .default_width(500)
+        .default_height(400)
+        .build();
+
+    let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    hbox.set_margin_top(12);
+    hbox.set_margin_bottom(12);
+    hbox.set_margin_start(12);
+    hbox.set_margin_end(12);
+
+    // Left: family list
+    let fam_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .width_request(200)
+        .build();
+    let fam_list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .build();
+    fam_scroll.set_child(Some(&fam_list));
+
+    // Right: face list
+    let face_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .width_request(200)
+        .build();
+    let face_list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .build();
+    face_scroll.set_child(Some(&face_list));
+
+    hbox.append(&fam_scroll);
+    hbox.append(&face_scroll);
+
+    // Bottom: preview entry + buttons
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    vbox.append(&hbox);
+
+    let preview_entry = gtk::Entry::builder()
+        .placeholder_text("Selected font")
+        .build();
+    vbox.append(&preview_entry);
+
+    let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    btn_box.set_halign(gtk::Align::End);
+    let ok_btn = gtk::Button::with_label("OK");
+    let cancel_btn = gtk::Button::with_label("Cancel");
+    btn_box.append(&ok_btn);
+    btn_box.append(&cancel_btn);
+    vbox.append(&btn_box);
+
+    dialog.set_child(Some(&vbox));
+
+    // Populate families
+    let font_map = pangocairo::FontMap::default();
+    let families: Vec<gtk::pango::FontFamily> = font_map.list_families();
+    let mut family_data: Vec<(String, Vec<gtk::pango::FontFace>)> = Vec::new();
+    for family in families {
+        let name = family.name().to_string();
+        let faces = family.list_faces();
+        family_data.push((name, faces));
+    }
+    // Sort by name
+    family_data.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let family_data_ref = std::rc::Rc::new(std::cell::RefCell::new(family_data));
+
+    for (name, _) in family_data_ref.borrow().iter() {
+        let row = gtk::ListBoxRow::new();
+        let label = gtk::Label::new(Some(name));
+        label.set_halign(gtk::Align::Start);
+        label.set_margin_start(6);
+        label.set_margin_end(6);
+        label.set_margin_top(6);
+        label.set_margin_bottom(6);
+        row.set_child(Some(&label));
+        fam_list.append(&row);
+    }
+
+    // Track which family is currently selected so the face callback can
+    // reconstruct the exact name without parsing the preview entry text.
+    let selected_family_idx: std::rc::Rc<std::cell::Cell<Option<usize>>> =
+        std::rc::Rc::new(std::cell::Cell::new(None));
+
+    // When family selected → populate faces
+    let face_list_weak = face_list.downgrade();
+    let preview_weak = preview_entry.downgrade();
+    let family_data_clone = family_data_ref.clone();
+    let sel_fam_idx_clone = selected_family_idx.clone();
+    fam_list.connect_row_selected(move |_, row| {
+        let Some(face_list) = face_list_weak.upgrade() else { return };
+        let Some(preview) = preview_weak.upgrade() else { return };
+
+        // Clear faces
+        while let Some(child) = face_list.last_child() {
+            face_list.remove(&child);
+        }
+
+        let Some(row) = row else {
+            sel_fam_idx_clone.set(None);
+            return;
+        };
+        let idx = row.index() as usize;
+        sel_fam_idx_clone.set(Some(idx));
+
+        let data = family_data_clone.borrow();
+        let Some((family_name, faces)) = data.get(idx) else { return };
+
+        for face in faces {
+            let face_name = face.face_name().to_string();
+            let row = gtk::ListBoxRow::new();
+            let label = gtk::Label::new(Some(&face_name));
+            label.set_halign(gtk::Align::Start);
+            label.set_margin_start(6);
+            label.set_margin_end(6);
+            label.set_margin_top(6);
+            label.set_margin_bottom(6);
+            row.set_child(Some(&label));
+            face_list.append(&row);
+        }
+        // Default preview = family base
+        preview.set_text(family_name);
+    });
+
+    // When face selected → update preview with reconstructed exact name
+    let preview_weak2 = preview_entry.downgrade();
+    let family_data_clone2 = family_data_ref.clone();
+    let sel_fam_idx_clone2 = selected_family_idx.clone();
+    face_list.connect_row_selected(move |_, row| {
+        let Some(preview) = preview_weak2.upgrade() else { return };
+        let Some(row) = row else { return };
+
+        let face_idx = row.index() as usize;
+        let fam_idx = sel_fam_idx_clone2.get();
+        let Some(fam_idx) = fam_idx else { return };
+
+        let data = family_data_clone2.borrow();
+        let Some((family_name, faces)) = data.get(fam_idx) else { return };
+        let Some(face) = faces.get(face_idx) else { return };
+
+        let face_name = face.face_name().to_string();
+        // Reconstruct exact family name:
+        // If face_name starts with digits (optical size), prepend them to family.
+        let reconstructed = if let Some(first_token) = face_name.split_whitespace().next() {
+            if first_token.chars().all(|c| c.is_ascii_digit()) {
+                format!("{} {}", family_name, first_token)
+            } else {
+                family_name.clone()
+            }
+        } else {
+            family_name.clone()
+        };
+        preview.set_text(&reconstructed);
+    });
+
+    // OK button
+    let s = sender.clone();
+    let dialog_weak = dialog.downgrade();
+    ok_btn.connect_clicked(move |_| {
+        let Some(dialog) = dialog_weak.upgrade() else { return };
+        let font_text = preview_entry.text().to_string();
+        if !font_text.is_empty() {
+            s.input(AppInput::SetFontFamily(font_text));
+        }
+        dialog.close();
+    });
+
+    // Cancel button
+    let dialog_for_cancel = dialog.clone();
+    cancel_btn.connect_clicked(move |_| {
+        dialog_for_cancel.close();
+    });
+
+    dialog.present();
 }

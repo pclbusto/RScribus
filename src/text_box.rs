@@ -150,6 +150,10 @@ impl TextBox {
         let list = pango::AttrList::new();
         for attr in &self.attributes {
             let mut pa: pango::Attribute = match &attr.value {
+                // AttrFamily passes the name directly to Pango/fontconfig without going
+                // through FontDescription::from_string, which would mis-parse a trailing
+                // number in the family name (e.g. "EB Garamond 12") as the point size,
+                // stripping it and causing fontconfig to resolve the wrong optical variant.
                 AttrValue::Family(f) => pango::AttrString::new_family(f).into(),
                 AttrValue::Size(pt) => {
                     pango::AttrSize::new((*pt * pango::SCALE as f64) as i32).into()
@@ -489,6 +493,19 @@ impl TextBox {
 
 }
 
+// ── Page-number substitution ───────────────────────────────────────────────────
+
+impl TextBox {
+    /// Returns a copy with `{{page}}` and `{{numpages}}` replaced by the given values.
+    pub fn substitute_page_numbers(&self, page_num: usize, total_pages: usize) -> Self {
+        let mut tb = self.clone();
+        tb.text = tb.text
+            .replace("{{page}}", &page_num.to_string())
+            .replace("{{numpages}}", &total_pages.to_string());
+        tb
+    }
+}
+
 // ── Cursor movement ───────────────────────────────────────────────────────────
 
 impl TextBox {
@@ -537,10 +554,7 @@ impl TextBox {
     }
 
     pub fn move_cursor_vertical(&mut self, up: bool, extend: bool, frame_w_px: f64, scale: f64) {
-        use pango::prelude::FontMapExt;
-        let font_map = pangocairo::FontMap::default();
-        let ctx = font_map.create_context();
-        pangocairo::functions::context_set_resolution(&ctx, 25.4 * scale);
+        let ctx = make_screen_pango_ctx(scale);
         let padding = self.padding * scale;
         let layout = self.prepare_layout(&ctx, frame_w_px, padding);
 
@@ -607,6 +621,19 @@ impl TextBox {
     }
 }
 
+fn make_screen_pango_ctx(scale: f64) -> pango::Context {
+    use pango::prelude::FontMapExt;
+    let font_map = pangocairo::FontMap::default();
+    let ctx = font_map.create_context();
+    pangocairo::functions::context_set_resolution(&ctx, 25.4 * scale);
+    if let Ok(mut opts) = cairo::FontOptions::new() {
+        opts.set_hint_metrics(cairo::HintMetrics::Off);
+        opts.set_hint_style(cairo::HintStyle::Slight);
+        pangocairo::functions::context_set_font_options(&ctx, Some(&opts));
+    }
+    ctx
+}
+
 // ── Layout & rendering ────────────────────────────────────────────────────────
 
 impl TextBox {
@@ -636,7 +663,9 @@ impl TextBox {
         layout.set_text(display_text);
         let font_desc = pango::FontDescription::from_string(&self.font_description);
         layout.set_font_description(Some(&font_desc));
-        layout.set_width(((frame_w - 2.0 * padding) * pscale) as i32);
+        let resolution = pangocairo::functions::context_get_resolution(pango_ctx);
+        let pt_per_px = if resolution > 0.0 { 72.0 / resolution } else { 1.0 };
+        layout.set_width(((frame_w - 2.0 * padding) * pt_per_px * pscale) as i32);
         layout.set_wrap(pango::WrapMode::Word);
         
         if let Some(attrs) = display_attrs {
@@ -666,6 +695,39 @@ impl TextBox {
                 padding,
                 elapsed.as_millis()
             );
+        }
+        layout
+    }
+
+    /// Like `prepare_layout` but uses `text` and `attrs` directly instead of `self.text`/`self.attributes`.
+    /// Used by the render cache to build truncated-frame layouts without cloning the TextBox.
+    pub fn prepare_layout_for_slice(
+        &self,
+        pango_ctx: &pango::Context,
+        frame_w: f64,
+        padding: f64,
+        text: &str,
+        attrs: &[TextAttribute],
+    ) -> pango::Layout {
+        let pscale = pango::SCALE as f64;
+        let layout = pango::Layout::new(pango_ctx);
+        layout.set_text(text);
+        let fd = pango::FontDescription::from_string(&self.font_description);
+        layout.set_font_description(Some(&fd));
+        let resolution = pangocairo::functions::context_get_resolution(pango_ctx);
+        let pt_per_px = if resolution > 0.0 { 72.0 / resolution } else { 1.0 };
+        layout.set_width(((frame_w - 2.0 * padding) * pt_per_px * pscale) as i32);
+        layout.set_wrap(pango::WrapMode::Word);
+        if !attrs.is_empty() {
+            layout.set_attributes(Some(&build_attr_list_slice(attrs, 0, text.len())));
+        }
+        layout.set_alignment(match self.alignment {
+            TextAlign::Left => pango::Alignment::Left,
+            TextAlign::Center => pango::Alignment::Center,
+            TextAlign::Right => pango::Alignment::Right,
+        });
+        if self.line_spacing != 1.0 {
+            layout.set_line_spacing(self.line_spacing as f32);
         }
         layout
     }
@@ -742,17 +804,87 @@ impl TextBox {
         self.required_height(pango_ctx, w, scale_factor) > h
     }
 
+    /// Returns how many bytes of `text` fit within the frame dimensions.
+    /// Avoids allocating a TextBox instance — callers pass only the relevant fields.
+    pub fn measure_capacity(
+        pango_ctx: &pango::Context,
+        text: &str,
+        attrs: &[TextAttribute],
+        font_desc: &str,
+        padding: f64,
+        line_spacing: f64,
+        align: TextAlign,
+        w_px: f64,
+        h_px: f64,
+        scale: f64,
+    ) -> usize {
+        if text.is_empty() {
+            return 0;
+        }
+        let pscale = pango::SCALE as f64;
+        let padding_px = padding * scale;
+
+        let layout = pango::Layout::new(pango_ctx);
+        layout.set_text(text);
+        let fd = pango::FontDescription::from_string(font_desc);
+        layout.set_font_description(Some(&fd));
+        let resolution = pangocairo::functions::context_get_resolution(pango_ctx);
+        let pt_per_px = if resolution > 0.0 { 72.0 / resolution } else { 1.0 };
+        layout.set_width(((w_px - 2.0 * padding_px) * pt_per_px * pscale) as i32);
+        layout.set_wrap(pango::WrapMode::Word);
+
+        if !attrs.is_empty() {
+            layout.set_attributes(Some(&build_attr_list_slice(attrs, 0, text.len())));
+        }
+
+        layout.set_alignment(match align {
+            TextAlign::Left => pango::Alignment::Left,
+            TextAlign::Center => pango::Alignment::Center,
+            TextAlign::Right => pango::Alignment::Right,
+        });
+
+        if line_spacing != 1.0 {
+            layout.set_line_spacing(line_spacing as f32);
+        }
+
+        let available_h_pango = ((h_px - 2.0 * padding_px) * pscale).max(0.0) as i32;
+        let (_, total_h) = layout.size();
+
+        if total_h <= available_h_pango {
+            return text.len();
+        }
+
+        let n_lines = layout.line_count();
+        let mut last_fit_end = 0usize;
+
+        for i in 0..n_lines {
+            if let Some(line) = layout.line(i) {
+                let start_byte = line.start_index() as i32;
+                let (strong, _) = layout.cursor_pos(start_byte);
+                let line_bottom = strong.y() + strong.height();
+                if line_bottom > available_h_pango {
+                    break;
+                }
+                last_fit_end = (line.start_index() as usize + line.length() as usize)
+                    .min(text.len());
+            }
+        }
+
+        while last_fit_end > 0 && !text.is_char_boundary(last_fit_end) {
+            last_fit_end -= 1;
+        }
+
+        last_fit_end
+    }
+
     /// Returns how many bytes of `self.text` fit within the frame dimensions.
     /// Used during chain reflow to split text across linked frames.
     pub fn text_capacity(&self, w_px: f64, h_px: f64, scale: f64) -> usize {
         let started = std::time::Instant::now();
-        use pango::prelude::FontMapExt;
         if self.text.is_empty() {
             return 0;
         }
-        let font_map = pangocairo::FontMap::default();
-        let ctx = font_map.create_context();
-        pangocairo::functions::context_set_resolution(&ctx, 25.4 * scale);
+        let ctx = make_screen_pango_ctx(scale);
         let padding = self.padding * scale;
         let layout = self.prepare_layout(&ctx, w_px, padding);
         let pscale = pango::SCALE as f64;
@@ -848,12 +980,21 @@ impl TextBox {
                 cr.set_source_rgb(0.3, 0.3, 0.3);
                 cr.set_line_width(1.0);
             }
-            cr.rectangle(0.0, 0.0, w, h);
+            cr.rectangle(0.5, 0.5, w - 1.0, h - 1.0);
             cr.stroke().unwrap();
         }
 
-        // Flow rendering (obstacles present, not editing)
-        if let Some(provider) = flow.filter(|_| !is_editing) {
+        if !is_export {
+            if let Ok(mut fo) = cairo::FontOptions::new() {
+                fo.set_antialias(cairo::Antialias::Good);
+                fo.set_hint_style(cairo::HintStyle::Slight);
+                fo.set_hint_metrics(cairo::HintMetrics::On);
+                cr.set_font_options(&fo);
+                pangocairo::functions::context_set_font_options(pango_ctx, Some(&fo));
+            }
+        }
+
+        if let Some(provider) = flow {
             self.render_with_provider(cr, pango_ctx, w, h, scale_factor, provider);
             return;
         }
@@ -984,7 +1125,9 @@ impl TextBox {
                 let layout = pango::Layout::new(pango_ctx);
                 layout.set_text(&self.text[text_pos..]);
                 layout.set_font_description(Some(&fd));
-                layout.set_width((iw * pscale) as i32);
+                let resolution = pangocairo::functions::context_get_resolution(pango_ctx);
+                let pt_per_px = if resolution > 0.0 { 72.0 / resolution } else { 1.0 };
+                layout.set_width((iw * pt_per_px * pscale) as i32);
                 layout.set_wrap(pango::WrapMode::Word);
                 layout.set_alignment(match self.alignment {
                     TextAlign::Left   => pango::Alignment::Left,
@@ -1052,10 +1195,7 @@ impl TextBox {
         scale: f64,
         frame_w_px: f64,
     ) -> usize {
-        use pango::prelude::FontMapExt;
-        let font_map = pangocairo::FontMap::default();
-        let ctx = font_map.create_context();
-        pangocairo::functions::context_set_resolution(&ctx, 25.4 * scale);
+        let ctx = make_screen_pango_ctx(scale);
         let pscale = pango::SCALE as f64;
         let padding = self.padding * scale;
         let layout = self.prepare_layout(&ctx, frame_w_px, padding);
